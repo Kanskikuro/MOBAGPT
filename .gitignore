@@ -41,6 +41,10 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
+# Packaging / generated DB
+*.egg-info/
+data/*.db
+
 # =========================
 # NODE / TYPESCRIPT
 # =========================

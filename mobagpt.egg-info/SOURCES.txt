@@ -1,0 +1,8 @@
+LICENSE
+README.md
+pyproject.toml
+mobagpt.egg-info/PKG-INFO
+mobagpt.egg-info/SOURCES.txt
+mobagpt.egg-info/dependency_links.txt
+mobagpt.egg-info/requires.txt
+mobagpt.egg-info/top_level.txt
