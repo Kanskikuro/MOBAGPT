@@ -75,7 +75,46 @@ class RiotApiSettings:
     request_timeout_seconds: float = 10.0
 
 
+@dataclass(frozen=True)
+class OtpSettings:
+    """Component 3 (OTP DB) ingestion source. Identifies one-trick mains via
+    Champion-Mastery-V4 point concentration, then samples their recent match
+    history on that champion. Reuses RiotApiSettings' seed pool
+    (ingestion.riot_api.identity.seed_challenger_puuids) and HTTP client
+    rather than duplicating either - no rate-limit, platform, or region
+    settings live here."""
+
+    # A player qualifies as a one-trick on their single top-mastery champion
+    # when *both* clear their threshold - absolute points alone would catch
+    # long-tenured players who've simply played a lot of everything;
+    # concentration alone would catch a fresh account with only one champion
+    # played a handful of times.
+    min_mastery_points: int = 200_000
+    min_mastery_concentration: float = 0.5  # top champion's share of total mastery points
+
+    # Caps a run's match+timeline fetch volume to something predictable
+    # under the dev-key rate limit - same rationale as
+    # RiotApiSettings.max_seed_summoners. Every seeded puuid needs its own
+    # mastery call just to check qualification (no "find high-mastery
+    # players" query exists), so a full run's request volume is dominated by
+    # the seed pool size, not this cap - but this still bounds the
+    # (potentially much heavier) per-one-trick match+timeline fetch phase.
+    max_one_tricks_per_run: int = 50
+
+    # Deeper per-player sample than RiotApiSettings.matches_per_summoner
+    # (15) - OTP's point is depth on a known individual, not breadth across
+    # many players.
+    matches_per_one_trick: int = 20
+
+    # A purchase before this timestamp counts as a "starting item" - a fixed
+    # cutoff rather than detecting the first recall event (known
+    # simplification, same spirit as ingestion.riot_api.timeline's
+    # undo-handling). ~90s covers the pre-minions-spawn opening buy.
+    starting_items_cutoff_ms: int = 90_000
+
+
 DATA_DRAGON = DataDragonSettings()
 PATCH_POLICY = PatchPolicy()
 WIKI = WikiSettings()
 RIOT_API = RiotApiSettings()
+OTP = OtpSettings()

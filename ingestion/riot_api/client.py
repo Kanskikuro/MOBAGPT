@@ -157,3 +157,13 @@ def fetch_match_timeline(match_id: str) -> dict:
     fetch_match's match summary."""
     url = _regional_url(f"/lol/match/v5/matches/{match_id}/timeline")
     return _get(url)
+
+
+def fetch_champion_masteries(puuid: str) -> list[dict]:
+    """Champion-Mastery-V4, platform routing. Every champion the player has
+    earned mastery points on (championId, championPoints, championLevel,
+    ...), one entry per champion - used by ingestion.otp to identify
+    one-trick mains from mastery point concentration. Not assumed
+    pre-sorted by the API; callers should pick the max explicitly."""
+    url = _platform_url(f"/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}")
+    return _get(url)

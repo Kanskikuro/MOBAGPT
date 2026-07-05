@@ -4,11 +4,12 @@ MatchupStatistics, ChampionSynergy, ChampionCounters, ItemStatistics,
 ItemCounterStatistics, RuneStatistics, MatchTimeline, BuildPathStatistics,
 SkillOrderStatistics, all populated by ingestion/riot_api.
 
-The OTP DB tables (otp_builds, otp_players, evaluation_runs) live in the
-same physical SQLite file per docs/sepc.md's "Database" section, but are
-added in a later migration when that ingestion exists. The model/inference
-boundary is enforced by which query-layer module callers import (see
-CLAUDE.md), not by physical file separation.
+Component 3 (OTP DB): OtpPlayer, OtpBuild, populated by ingestion/otp.
+`evaluation_runs` remains pending (Phase 2 eval harness). All OTP tables
+live in the same physical SQLite file per docs/sepc.md's "Database"
+section, not a separate physical database. The model/inference boundary is
+enforced by which query-layer module callers import (see CLAUDE.md), not
+by physical file separation.
 """
 
 from __future__ import annotations
@@ -623,3 +624,85 @@ class SkillOrderStatistics(Base):
     win_rate: Mapped[float]
     pick_rate: Mapped[float]
     sample_size: Mapped[int]
+
+
+class OtpPlayer(Base):
+    """One row per identified one-trick main, per docs/sepc.md Component 3.
+    Identified via Champion-Mastery-V4: a player qualifies on their single
+    top-mastery champion when both absolute points and concentration
+    (top champion's points / total points across all champions) clear
+    OtpSettings' thresholds. Uniqueness is (puuid, primary_champion_id), NOT
+    patch-scoped - champion mastery is Riot's lifetime-cumulative stat, it
+    has no per-patch meaning to key against. Re-running ingestion/otp for a
+    new patch refreshes this row rather than duplicating it; `patch_id`
+    records only the *last* patch a refresh happened under, and
+    win_rate/games_sampled are recomputed over every otp_builds row ever
+    stored for this player (not just this run's newly-inserted subset) -
+    see ingestion.otp.source._refresh_player_aggregate. If per-patch OTP
+    win rates are ever needed, derive them from otp_builds.patch_id
+    directly, which keeps one row per sampled match with its own concrete
+    patch."""
+
+    __tablename__ = "otp_players"
+    __table_args__ = (UniqueConstraint("puuid", "primary_champion_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    puuid: Mapped[str]
+    primary_champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]  # most common team_position across this player's sampled matches
+    patch_id: Mapped[int | None] = mapped_column(ForeignKey("patches.id"))  # last patch refreshed under
+    mastery_points: Mapped[int]
+    mastery_concentration: Mapped[float]
+    games_sampled: Mapped[int]
+    win_rate: Mapped[float]
+    sample_size: Mapped[int]  # == games_sampled
+
+    builds: Mapped[list["OtpBuild"]] = relationship(
+        back_populates="player", cascade="all, delete-orphan"
+    )
+
+
+class OtpBuild(Base):
+    """One row per (otp_player, sampled match) - per docs/sepc.md Component
+    3, OTP data must survive at individual-build granularity for
+    build-archetype clustering and situational-trigger labeling; a
+    pre-aggregated shape (like ItemStatistics) would destroy exactly the
+    signal the spec wants. otp_players.win_rate/games_sampled already cover
+    the player-level aggregate; there's no separate sample_size column here
+    (this table is a raw-instance capture table, like MatchParticipant, not
+    a *_statistics aggregate).
+
+    match_id is deliberately NOT a foreign key into `matches`: OTP-sampled
+    matches are individually-targeted one-trick samples, not part of the
+    Challenger *aggregate* sample matches/match_participants/
+    matchup_statistics (etc.) represent. ingestion.riot_api's _recompute_*
+    functions scan every row in `matches` for the resolved patch with no
+    source attribution, so sharing the table would silently bias those
+    aggregates toward one-trick players' atypical win rates. A match
+    captured by both riot_api (if the same player was also a Challenger
+    seed) and otp keeps two independent raw_data copies - a known, accepted
+    duplication, not a bug.
+
+    patch_id is nullable, mirroring Match.patch_id: if ingestion/otp runs
+    before data_dragon has ingested the target patch, builds are still
+    stored (with a warning) rather than the run failing outright."""
+
+    __tablename__ = "otp_builds"
+    __table_args__ = (UniqueConstraint("otp_player_id", "match_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    otp_player_id: Mapped[int] = mapped_column(ForeignKey("otp_players.id"))
+    patch_id: Mapped[int | None] = mapped_column(ForeignKey("patches.id"))
+    match_id: Mapped[str]
+    win: Mapped[bool]
+    role: Mapped[str]
+    starting_items: Mapped[list] = mapped_column(JSON)
+    completed_items: Mapped[list] = mapped_column(JSON)
+    final_items: Mapped[list] = mapped_column(JSON)
+    primary_runes: Mapped[list] = mapped_column(JSON)
+    secondary_runes: Mapped[list] = mapped_column(JSON)
+    skill_order: Mapped[list] = mapped_column(JSON)  # list of [skill_slot, level_up_type] pairs
+    enemy_champion_id: Mapped[int | None] = mapped_column(ForeignKey("champions.champion_id"))
+    raw_data: Mapped[dict] = mapped_column(JSON)  # the full match participant dict
+
+    player: Mapped["OtpPlayer"] = relationship(back_populates="builds")

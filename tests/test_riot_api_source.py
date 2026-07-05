@@ -19,7 +19,7 @@ from db.models import (
     SkillOrderStatistics,
 )
 from ingestion.riot_api import client
-from ingestion.riot_api.source import RiotApiSource, _completed_item_order, _skill_level_order
+from ingestion.riot_api.source import RiotApiSource
 
 AHRI = 103
 ZED = 238
@@ -143,7 +143,9 @@ def test_fetch_dedups_puuids_and_match_ids(monkeypatch) -> None:
         or {"metadata": {"matchId": match_id}, "info": {"frames": []}},
     )
 
-    data = RiotApiSource().fetch("14.14.1")
+    source = RiotApiSource()
+    source.warnings = []
+    data = source.fetch("14.14.1")
 
     fetched_ids = {m["metadata"]["matchId"] for m in data["matches"]}
     assert fetched_ids == {"NA1_1", "NA1_2", "NA1_3"}  # deduped across both summoners
@@ -616,46 +618,6 @@ def _skill_level_up(
         "skillSlot": skill_slot,
         "levelUpType": level_up_type,
     }
-
-
-def test_completed_item_order_filters_components_and_consumables() -> None:
-    terminal_ids = {RABADONS, INFINITY_EDGE}
-    events = [
-        _purchase(1, LONG_SWORD, 1000),  # component - not in terminal_ids, excluded
-        _purchase(1, HEALTH_POTION, 1500),  # consumable - not in terminal_ids, excluded
-        _purchase(1, RABADONS, 5000),
-        _purchase(1, INFINITY_EDGE, 9000),
-    ]
-
-    order = _completed_item_order(events, terminal_ids)
-
-    assert order[1] == [RABADONS, INFINITY_EDGE]
-
-
-def test_completed_item_order_nets_out_a_straightforward_undo() -> None:
-    terminal_ids = {RABADONS, INFINITY_EDGE}
-    events = [
-        _purchase(1, RABADONS, 1000),
-        _undo(1, RABADONS, 1100),  # immediately undone - shouldn't count
-        _purchase(1, INFINITY_EDGE, 2000),
-    ]
-
-    order = _completed_item_order(events, terminal_ids)
-
-    assert order[1] == [INFINITY_EDGE]
-
-
-def test_skill_level_order_tracks_slot_and_level_up_type_in_order() -> None:
-    events = [
-        _skill_level_up(1, 2, 2000),  # deliberately out of timestamp order
-        _skill_level_up(1, 1, 1000),
-        _skill_level_up(1, 1, 3000),
-        _skill_level_up(1, 4, 4000, level_up_type="EVOLVE"),
-    ]
-
-    order = _skill_level_order(events)
-
-    assert order[1] == [(1, "NORMAL"), (2, "NORMAL"), (1, "NORMAL"), (4, "EVOLVE")]
 
 
 def test_build_path_and_skill_order_statistics_via_load(session: Session) -> None:

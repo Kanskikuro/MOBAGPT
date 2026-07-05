@@ -2,24 +2,25 @@
 
 What's actually implemented so far, as of patch `16.13.1`. For the full
 product vision and phased delivery plan, see [docs/sepc.md](sepc.md); this
-document covers Phase 1's knowledge-DB work plus the match/matchup-pairing
-slice of the statistical DB, and how they're built.
+document covers Phase 1's knowledge-DB work, the statistical DB's
+match/matchup-pairing slice, and the OTP DB, and how they're built.
 
 ## Database
 
 One SQLite file (`data/knowledge.db`, gitignored — regenerate it by running
 migrations + ingestion), one normalized schema. `docs/sepc.md`'s "Database"
 section lists knowledge, statistical, and OTP tables together as a single
-schema rather than separate physical databases; the knowledge tables plus
-the match-capture, pairing, final-build, itemization-counter,
+schema rather than separate physical databases; the knowledge tables, the
+match-capture, pairing, final-build, itemization-counter,
 purchase-order/build-path, and skill-order statistical tables (`matches`,
 `match_participants`, `matchup_statistics`, `champion_synergy`,
 `champion_counters`, `item_statistics`, `rune_statistics`,
 `item_counter_statistics`, `match_timelines`, `build_path_statistics`,
-`skill_order_statistics`) exist today — the rest of Component 2 (stat-shard
-perk stats, game-duration splits) and all of Component 3 (OTP) are still to
-come. Schema is managed by Alembic (`migrations/`), not
-`Base.metadata.create_all()` — every schema change is a migration.
+`skill_order_statistics`), and Component 3's OTP tables (`otp_players`,
+`otp_builds`) all exist today — the rest of Component 2 (stat-shard perk
+stats, game-duration splits) is still to come. Schema is managed by
+Alembic (`migrations/`), not `Base.metadata.create_all()` — every schema
+change is a migration.
 
 The CLAUDE.md hard rule that `/model` never imports the statistical-DB query
 layer will be enforced by which modules import which query-layer code once
@@ -49,17 +50,20 @@ both exist, not by physical file separation (there's no `/model` yet).
 | `match_timelines` | `riot_api` | raw Match-V5 timeline (frame-by-frame event log), keyed on `match_id` like `matches` |
 | `build_path_statistics` | `riot_api` | per `(patch, champion+role, purchase_order, item)` win/pick rate from completed-item purchase order, recomputed in full on every run |
 | `skill_order_statistics` | `riot_api` | per `(patch, champion+role, level, skill_slot, level_up_type)` win/pick rate from ability leveling order, recomputed in full on every run |
+| `otp_players` | `otp` | one row per identified one-trick main, keyed on `(puuid, primary_champion_id)`, not patch-scoped |
+| `otp_builds` | `otp` | one row per (otp_player, sampled match) — raw-instance build capture, not a pre-aggregated `*_statistics` table |
 
 `matches`/`match_participants`/`matchup_statistics`/`champion_synergy`/
 `champion_counters`/`item_statistics`/`rune_statistics`/
 `item_counter_statistics`/`match_timelines`/`build_path_statistics`/
-`skill_order_statistics` have a working, tested pipeline
-(`ingestion/riot_api`) but **zero live rows** in this environment — no
-`RIOT_API_KEY` is configured here, and every test monkeypatches the client
-layer rather than hitting the real API (same pattern as
-`data_dragon`/`wiki`). Running
-`python -m ingestion.run --source riot_api --patch <patch>` against real
-data requires your own key (register at the Riot Developer Portal).
+`skill_order_statistics`/`otp_players`/`otp_builds` have a working, tested
+pipeline (`ingestion/riot_api`, `ingestion/otp`) but **zero live rows** in
+this environment — no `RIOT_API_KEY` is configured here, and every test
+monkeypatches the client layer rather than hitting the real API (same
+pattern as `data_dragon`/`wiki`). Running
+`python -m ingestion.run --source riot_api --patch <patch>` (or `--source
+otp`) against real data requires your own key (register at the Riot
+Developer Portal).
 
 ### Tables that exist but are still empty
 
@@ -69,9 +73,6 @@ pipelines that don't exist yet (semantic tag/rating extraction, build
 archetype clustering from statistical + OTP data). Their schema is defined
 now so downstream code can be written against a stable shape, per the same
 pattern as everything else in this schema.
-
-All of Component 3 (`otp_builds`, `otp_players`) doesn't exist as tables
-yet — no migration has added them.
 
 ## Ingestion
 
@@ -414,6 +415,91 @@ covers "final build").
 **Deferred, on purpose (tracked in Known gaps):** stat-shard perk stats,
 game-duration splits, multi-region crawling, and historical-patch backfill.
 
+### `otp`
+
+Component 3 (OTP DB, `docs/sepc.md`): identifies high-ELO one-trick mains
+and captures their per-match builds. `docs/sepc.md`'s literal source for
+this component is OneTricks.gg, under "the same ToS caveat" as Lolalytics
+(check ToS/robots.txt, prefer deriving from Riot API match data instead).
+OneTricks.gg's `robots.txt` returns **HTTP 429 on every fetch attempt**
+(tried both `www.onetricks.gg` and bare `onetricks.gg`) — a harder block
+than Lolalytics (which at least served a readable robots.txt with named-bot
+disallow rules; see `item_counter_statistics` above for that precedent). So
+`otp` derives the one-trick signal directly from the Riot API instead:
+Champion-Mastery-V4 point concentration identifies one-trick mains (no
+other tool in this codebase tracks "mastery" or "one-trick" status), then
+the same Match-V5 match/timeline endpoints `riot_api` already uses capture
+their recent builds.
+
+**Seeding and identification:** reuses `riot_api`'s exact Challenger-seed
+pool (`ingestion.riot_api.identity.seed_challenger_puuids`, promoted out of
+`RiotApiSource` so both sources share it verbatim). For each seeded puuid,
+`client.fetch_champion_masteries` (Champion-Mastery-V4, platform-routed)
+returns every champion the player has mastery points on.
+`_qualify_one_trick` computes the top champion's points and *concentration*
+(top champion's points / total points across all champions); a player
+qualifies as a one-trick on that champion only when **both**
+`OtpSettings.min_mastery_points` and `OtpSettings.min_mastery_concentration`
+clear — points alone would catch long-tenured players who've played
+everything a lot, concentration alone would catch a fresh account with
+only one champion played a handful of times. Qualifying candidates are
+capped at `OtpSettings.max_one_tricks_per_run`, but every seeded puuid
+still needs its own mastery call to check qualification in the first place
+(Champion-Mastery-V4 has no "find me high-mastery players" query) — so a
+full run's request volume is dominated by the 300-puuid seed pool, not
+this cap; expect an hour-plus real run under a dev key's rate limit.
+
+**Build capture:** for each qualifying (puuid, champion) pair, recent match
+ids (`client.fetch_match_ids`, capped at
+`OtpSettings.matches_per_one_trick`, deeper per-player than
+`RiotApiSettings.matches_per_summoner` since OTP's point is depth on a
+known individual, not breadth) are fetched along with each match's summary
+and timeline. Unlike `riot_api`, a match whose timeline fetch fails is
+dropped entirely rather than partially stored — every interesting `otp`
+column (starting items, completed-item order, skill order) comes from the
+timeline, so a match without one has nothing worth persisting. Starting
+items are purchases before `OtpSettings.starting_items_cutoff_ms` (~90s,
+covering the pre-minions-spawn opening buy) — a fixed-cutoff approximation
+since Match-V5 has no first-recall event to key off instead; unlike
+completed-item order, starting items keep components/consumables (a
+starting buy is commonly a Doran's item plus potions/wards, neither of
+which is "terminal"). Completed-item order, skill order, and terminal-item
+filtering reuse `ingestion.riot_api.timeline` (promoted out of
+`riot_api/source.py`'s former private helpers so both sources share the
+same parsing logic verbatim, decoupled from the `MatchTimeline` ORM row
+since `otp`'s fetched timelines are never persisted as `MatchTimeline` rows
+— see below). The lane opponent (`enemy_champion_id`) uses the same
+team_position + opposite-`win` pairing rule `champion_counters` uses.
+
+**Schema:** `otp_players` is one row per `(puuid, primary_champion_id)`,
+*not* patch-scoped — Champion Mastery is Riot's lifetime-cumulative stat,
+so keying it per-patch would be semantically wrong. Re-running `otp` for a
+new patch refreshes the existing row rather than duplicating it;
+`win_rate`/`games_sampled` are recomputed from *every* `OtpBuild` row ever
+stored for that player (`_refresh_player_aggregate`), not just the run's
+new inserts, so a second run doesn't misleadingly collapse the sample to
+just that run's delta. `otp_builds` is one row per `(otp_player, sampled
+match)` — deliberately *not* pre-aggregated like `ItemStatistics`, since
+build-archetype clustering and situational-trigger labeling (this
+component's actual purpose per `docs/sepc.md`) need individual build
+instances, not pre-aggregated stats; `otp_players`' win_rate/sample_size
+already cover the player-level aggregate. `otp_builds.match_id` is
+deliberately **not** a foreign key into `matches`: OTP's samples are
+individually-targeted one-trick picks, not part of the Challenger-aggregate
+sample `matches`/`matchup_statistics`/etc. represent — `riot_api`'s
+`_recompute_*` functions scan every `Match` row for the resolved patch with
+no source attribution, so sharing the table would silently bias those
+aggregates toward one-tricks' atypical win rates. A match captured by both
+sources (if a one-trick was also a Challenger seed) keeps two independent
+`raw_data` copies — accepted, known duplication, cheap since match data is
+immutable. `otp_builds.patch_id` is nullable, mirroring `Match.patch_id`
+exactly (same "patch not yet ingested" warn-and-continue path, not a hard
+failure).
+
+**Deferred, on purpose:** build-archetype clustering itself (this slice
+only captures the raw signal it needs), multi-region crawling, and
+historical-patch backfill for OTP data specifically.
+
 ## Config (`config/settings.py`)
 
 Frozen dataclasses, one per concern: `DataDragonSettings`, `WikiSettings`,
@@ -460,9 +546,20 @@ Per `docs/sepc.md`'s Phase 1 scope, still outstanding:
   "itemization-vs-matchup" signal from Riot match data instead, per
   `docs/sepc.md`'s Data Sources rule; a Lolalytics fallback would need a
   human-operated collection step, not an ingestion module.
-- **OTP DB** (Component 3) — OneTricks.gg.
-- **Build archetype extraction** — needs both of the above; `riot_api`'s
-  current slice alone isn't enough (no OTP data captured yet).
+- **OTP DB** (Component 3) — one-trick identification and build capture
+  done (`otp`: `otp_players`, `otp_builds`, see above), but no live data
+  has been ingested in this environment (needs a `RIOT_API_KEY`) and no
+  live data exists to confirm real-world mastery/concentration thresholds
+  are well-calibrated. Derived directly from the Riot API rather than
+  OneTricks.gg: its `robots.txt` returns HTTP 429 on every fetch attempt
+  (both `www.onetricks.gg` and bare `onetricks.gg`), a harder block than
+  Lolalytics, so per the same precedent as `item_counter_statistics`, the
+  one-trick signal (Champion-Mastery-V4 point concentration) and their
+  builds (Match-V5, same as `riot_api`) are captured directly instead.
+- **Build archetype extraction** — needs both of the above; `champion_ratings`
+  (semantic tags/ratings) is still unstarted, so build archetype
+  clustering can't begin yet even though `otp_builds`/statistical data are
+  both now available to feed it.
 - **Wiki Counters-table parsing** — decode `Template:Ctable`'s legend.
 - **Runes, mechanics, minions, monsters wiki enrichment** — each needs its
   own page-structure discovery pass, the same way champions and items were
