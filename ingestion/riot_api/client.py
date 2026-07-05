@@ -149,3 +149,11 @@ def fetch_match(match_id: str) -> dict:
     """Match-V5, regional routing."""
     url = _regional_url(f"/lol/match/v5/matches/{match_id}")
     return _get(url)
+
+
+def fetch_match_timeline(match_id: str) -> dict:
+    """Match-V5 timeline, regional routing. Frame-by-frame event log (item
+    purchases, skill level-ups, ...) - a separate, heavier call from
+    fetch_match's match summary."""
+    url = _regional_url(f"/lol/match/v5/matches/{match_id}/timeline")
+    return _get(url)

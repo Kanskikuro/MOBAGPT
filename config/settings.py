@@ -64,6 +64,10 @@ class RiotApiSettings:
     max_seed_summoners: int = 300
     matches_per_summoner: int = 15
 
+    # How many completed (non-component, non-consumable) items to track per
+    # build_path_statistics row - deeper slots get sparse and less comparable.
+    build_path_slots: int = 4
+
     # (max_requests, window_seconds) pairs, all enforced simultaneously.
     # Defaults match a Riot dev key's app rate limit.
     rate_limits: tuple[tuple[int, int], ...] = ((20, 1), (100, 120))

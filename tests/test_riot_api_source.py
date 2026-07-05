@@ -1,18 +1,24 @@
+import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from db.models import (
+    BuildPathStatistics,
     ChampionCounters,
     ChampionSynergy,
+    Item,
     ItemStatistics,
+    ItemTag,
     Match,
     MatchParticipant,
+    MatchTimeline,
     MatchupStatistics,
     Patch,
     RuneStatistics,
+    SkillOrderStatistics,
 )
 from ingestion.riot_api import client
-from ingestion.riot_api.source import RiotApiSource
+from ingestion.riot_api.source import RiotApiSource, _completed_item_order, _skill_level_order
 
 AHRI = 103
 ZED = 238
@@ -128,11 +134,48 @@ def test_fetch_dedups_puuids_and_match_ids(monkeypatch) -> None:
     monkeypatch.setattr(
         client, "fetch_match", lambda match_id: {"metadata": {"matchId": match_id}, "info": {}}
     )
+    timeline_calls: list[str] = []
+    monkeypatch.setattr(
+        client,
+        "fetch_match_timeline",
+        lambda match_id: timeline_calls.append(match_id)
+        or {"metadata": {"matchId": match_id}, "info": {"frames": []}},
+    )
 
     data = RiotApiSource().fetch("14.14.1")
 
     fetched_ids = {m["metadata"]["matchId"] for m in data["matches"]}
     assert fetched_ids == {"NA1_1", "NA1_2", "NA1_3"}  # deduped across both summoners
+    # A timeline is fetched for every successfully-fetched match summary.
+    assert set(timeline_calls) == {"NA1_1", "NA1_2", "NA1_3"}
+    fetched_timeline_ids = {t["metadata"]["matchId"] for t in data["timelines"]}
+    assert fetched_timeline_ids == {"NA1_1", "NA1_2", "NA1_3"}
+
+
+def test_fetch_skips_timeline_when_match_summary_fetch_fails(monkeypatch) -> None:
+    monkeypatch.setattr(client, "fetch_league_entries", lambda: [{"puuid": "puuid-1"}])
+    monkeypatch.setattr(client, "fetch_match_ids", lambda puuid, **kwargs: ["NA1_1", "NA1_BAD"])
+
+    def _fetch_match(match_id: str) -> dict:
+        if match_id == "NA1_BAD":
+            raise requests.exceptions.RequestException("boom")
+        return {"metadata": {"matchId": match_id}, "info": {}}
+
+    monkeypatch.setattr(client, "fetch_match", _fetch_match)
+    timeline_calls: list[str] = []
+    monkeypatch.setattr(
+        client,
+        "fetch_match_timeline",
+        lambda match_id: timeline_calls.append(match_id)
+        or {"metadata": {"matchId": match_id}, "info": {"frames": []}},
+    )
+
+    source = RiotApiSource()
+    source.warnings = []
+    data = source.fetch("14.14.1")
+
+    assert timeline_calls == ["NA1_1"]  # NA1_BAD's summary fetch failed, so no timeline attempt
+    assert any("Match fetch failed" in w for w in source.warnings)
 
 
 def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) -> None:
@@ -164,6 +207,8 @@ def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) ->
     assert counts_first == {
         "matches": 2,
         "match_participants": 4,
+        # Neither _match payload includes a "timelines" key.
+        "match_timelines": 0,
         "matchup_statistics": 2,
         # Each match here has exactly one participant per side, so there are
         # no teammates to pair - champion_synergy stays empty.
@@ -174,6 +219,8 @@ def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) ->
         # _participant defaults to no items/runes selected.
         "item_statistics": 0,
         "rune_statistics": 0,
+        "build_path_statistics": 0,
+        "skill_order_statistics": 0,
     }
     # Re-running with the same fetched matches must not create duplicates -
     # matchup_statistics/champion_synergy/champion_counters are still
@@ -182,11 +229,14 @@ def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) ->
     assert counts_second == {
         "matches": 0,
         "match_participants": 0,
+        "match_timelines": 0,
         "matchup_statistics": 2,
         "champion_synergy": 0,
         "champion_counters": 2,
         "item_statistics": 0,
         "rune_statistics": 0,
+        "build_path_statistics": 0,
+        "skill_order_statistics": 0,
     }
 
     assert len(session.execute(select(Match)).scalars().all()) == 2
@@ -227,11 +277,14 @@ def test_load_skips_off_patch_matches(session: Session) -> None:
     assert counts == {
         "matches": 0,
         "match_participants": 0,
+        "match_timelines": 0,
         "matchup_statistics": 0,
         "champion_synergy": 0,
         "champion_counters": 0,
         "item_statistics": 0,
         "rune_statistics": 0,
+        "build_path_statistics": 0,
+        "skill_order_statistics": 0,
     }
     assert session.execute(select(Match)).scalars().all() == []
     assert any("off-patch" in warning for warning in source.warnings)
@@ -249,6 +302,8 @@ def test_load_without_ingested_patch_warns_and_skips_statistics(session: Session
     assert counts["champion_counters"] == 0
     assert counts["item_statistics"] == 0
     assert counts["rune_statistics"] == 0
+    assert counts["build_path_statistics"] == 0
+    assert counts["skill_order_statistics"] == 0
     assert any("not found in DB" in warning for warning in source.warnings)
     match = session.execute(select(Match).where(Match.match_id == "NA1_1")).scalar_one()
     assert match.patch_id is None
@@ -478,3 +533,190 @@ def test_item_and_rune_statistics_ignore_participants_with_nothing_selected(
 
     assert counts["item_statistics"] == 0
     assert counts["rune_statistics"] == 0
+
+
+LONG_SWORD = 1036
+HEALTH_POTION = 2003
+INFINITY_EDGE = 3031
+
+
+def _timeline(match_id: str, events: list[dict]) -> dict:
+    return {"metadata": {"matchId": match_id}, "info": {"frames": [{"events": events}]}}
+
+
+def _purchase(participant_id: int, item_id: int, timestamp: int) -> dict:
+    return {
+        "type": "ITEM_PURCHASED",
+        "timestamp": timestamp,
+        "participantId": participant_id,
+        "itemId": item_id,
+    }
+
+
+def _undo(participant_id: int, before_id: int, timestamp: int) -> dict:
+    return {
+        "type": "ITEM_UNDO",
+        "timestamp": timestamp,
+        "participantId": participant_id,
+        "beforeId": before_id,
+        "afterId": 0,
+    }
+
+
+def _skill_level_up(
+    participant_id: int, skill_slot: int, timestamp: int, level_up_type: str = "NORMAL"
+) -> dict:
+    return {
+        "type": "SKILL_LEVEL_UP",
+        "timestamp": timestamp,
+        "participantId": participant_id,
+        "skillSlot": skill_slot,
+        "levelUpType": level_up_type,
+    }
+
+
+def test_completed_item_order_filters_components_and_consumables() -> None:
+    terminal_ids = {RABADONS, INFINITY_EDGE}
+    events = [
+        _purchase(1, LONG_SWORD, 1000),  # component - not in terminal_ids, excluded
+        _purchase(1, HEALTH_POTION, 1500),  # consumable - not in terminal_ids, excluded
+        _purchase(1, RABADONS, 5000),
+        _purchase(1, INFINITY_EDGE, 9000),
+    ]
+
+    order = _completed_item_order(events, terminal_ids)
+
+    assert order[1] == [RABADONS, INFINITY_EDGE]
+
+
+def test_completed_item_order_nets_out_a_straightforward_undo() -> None:
+    terminal_ids = {RABADONS, INFINITY_EDGE}
+    events = [
+        _purchase(1, RABADONS, 1000),
+        _undo(1, RABADONS, 1100),  # immediately undone - shouldn't count
+        _purchase(1, INFINITY_EDGE, 2000),
+    ]
+
+    order = _completed_item_order(events, terminal_ids)
+
+    assert order[1] == [INFINITY_EDGE]
+
+
+def test_skill_level_order_tracks_slot_and_level_up_type_in_order() -> None:
+    events = [
+        _skill_level_up(1, 2, 2000),  # deliberately out of timestamp order
+        _skill_level_up(1, 1, 1000),
+        _skill_level_up(1, 1, 3000),
+        _skill_level_up(1, 4, 4000, level_up_type="EVOLVE"),
+    ]
+
+    order = _skill_level_order(events)
+
+    assert order[1] == [(1, "NORMAL"), (2, "NORMAL"), (1, "NORMAL"), (4, "EVOLVE")]
+
+
+def test_build_path_and_skill_order_statistics_via_load(session: Session) -> None:
+    session.add(Patch(version="14.14.1"))
+    session.add_all(
+        [
+            Item(
+                item_id=RABADONS,
+                name="Rabadon's Deathcap",
+                description="",
+                plaintext="",
+                gold_base=1600,
+                gold_total=3500,
+                gold_sell=2450,
+                raw_data={},
+            ),
+            Item(
+                item_id=INFINITY_EDGE,
+                name="Infinity Edge",
+                description="",
+                plaintext="",
+                gold_base=825,
+                gold_total=3500,
+                gold_sell=2450,
+                raw_data={},
+            ),
+            Item(
+                item_id=LONG_SWORD,
+                name="Long Sword",
+                description="",
+                plaintext="",
+                gold_base=350,
+                gold_total=350,
+                gold_sell=140,
+                raw_data={},
+                builds_into=[str(RABADONS)],  # non-empty - a component, not terminal
+            ),
+            Item(
+                item_id=HEALTH_POTION,
+                name="Health Potion",
+                description="",
+                plaintext="",
+                gold_base=50,
+                gold_total=50,
+                gold_sell=0,
+                raw_data={},
+            ),
+            ItemTag(item_id=HEALTH_POTION, tag="Consumable"),
+        ]
+    )
+    session.commit()
+
+    payload = {
+        "matches": [_match("NA1_1", "14.14.567890", AHRI, ZED, True)],
+        "timelines": [
+            _timeline(
+                "NA1_1",
+                [
+                    _purchase(1, LONG_SWORD, 1000),
+                    _purchase(1, HEALTH_POTION, 1500),
+                    _purchase(1, RABADONS, 5000),
+                    _purchase(1, INFINITY_EDGE, 9000),
+                    _skill_level_up(1, 1, 100),
+                    _skill_level_up(1, 2, 200),
+                    _skill_level_up(1, 1, 300),
+                ],
+            )
+        ],
+    }
+
+    source = RiotApiSource()
+    source.warnings = []
+    counts_first = source.load(session, "14.14.1", payload)
+    session.commit()
+    counts_second = source.load(session, "14.14.1", payload)
+    session.commit()
+
+    assert counts_first["match_timelines"] == 1
+    assert counts_second["match_timelines"] == 0  # already stored - idempotent
+    assert len(session.execute(select(MatchTimeline)).scalars().all()) == 1
+
+    build_rows = {
+        r.purchase_order: r for r in session.execute(select(BuildPathStatistics)).scalars().all()
+    }
+    assert set(build_rows) == {1, 2}
+    assert build_rows[1].item_id == RABADONS  # LONG_SWORD/HEALTH_POTION filtered out
+    assert build_rows[2].item_id == INFINITY_EDGE
+    for row in build_rows.values():
+        assert (row.champion_id, row.role) == (AHRI, "MIDDLE")
+        assert row.games == 1  # AHRI/MIDDLE played once this patch
+        assert row.picks == 1
+        assert row.win_rate == 1.0
+
+    skill_rows = {r.level: r for r in session.execute(select(SkillOrderStatistics)).scalars().all()}
+    assert {row.skill_slot for row in skill_rows.values()} == {1, 2}
+    assert skill_rows[1].skill_slot == 1
+    assert skill_rows[2].skill_slot == 2
+    assert skill_rows[3].skill_slot == 1
+    for row in skill_rows.values():
+        assert row.level_up_type == "NORMAL"
+        assert (row.champion_id, row.role) == (AHRI, "MIDDLE")
+        assert row.win_rate == 1.0
+
+    # Re-running is idempotent: no duplicate match_timelines row, but the
+    # derived stats are still fully recomputed (same counts, not doubled).
+    assert counts_second["build_path_statistics"] == 2
+    assert counts_second["skill_order_statistics"] == 3

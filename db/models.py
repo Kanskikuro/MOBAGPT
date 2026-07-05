@@ -1,7 +1,8 @@
 """Knowledge-database schema (Component 1 of docs/sepc.md), plus the
 statistical DB schema (Component 2): Match, MatchParticipant,
 MatchupStatistics, ChampionSynergy, ChampionCounters, ItemStatistics,
-RuneStatistics, all populated by ingestion/riot_api.
+RuneStatistics, MatchTimeline, BuildPathStatistics, SkillOrderStatistics,
+all populated by ingestion/riot_api.
 
 The OTP DB tables (otp_builds, otp_players, evaluation_runs) live in the
 same physical SQLite file per docs/sepc.md's "Database" section, but are
@@ -503,6 +504,82 @@ class RuneStatistics(Base):
     role: Mapped[str]
     rune_id: Mapped[int] = mapped_column(ForeignKey("runes.rune_id"))
     is_keystone: Mapped[bool]
+    games: Mapped[int]
+    picks: Mapped[int]
+    wins: Mapped[int]
+    win_rate: Mapped[float]
+    pick_rate: Mapped[float]
+    sample_size: Mapped[int]
+
+
+class MatchTimeline(Base):
+    """Raw Match-V5 timeline (frame-by-frame event log), keyed on the same
+    natural match_id as Match - immutable once played, so re-ingesting an
+    already-known match_id is a no-op, same rationale as Match.raw_data.
+    Feeds BuildPathStatistics/SkillOrderStatistics; kept as its own table
+    (rather than a second JSON column on Match) since it's a separate Riot
+    endpoint fetched in its own request."""
+
+    __tablename__ = "match_timelines"
+
+    match_id: Mapped[str] = mapped_column(ForeignKey("matches.match_id"), primary_key=True)
+    raw_data: Mapped[dict] = mapped_column(JSON)
+
+
+class BuildPathStatistics(Base):
+    """Per (patch, champion, role, purchase_order, item) win rate, from
+    participants' completed-item purchase order in ingestion/riot_api's
+    timeline processing. purchase_order is 1-based (1st/2nd/3rd/...
+    completed item this champion+role bought), capped at
+    RiotApiSettings.build_path_slots. 'Completed item' means a terminal,
+    non-consumable/non-trinket item (item_tags has no Consumable/Trinket
+    tag and Item.builds_into is empty) - see source.py's _terminal_item_ids
+    docstring for why depth alone isn't a reliable signal. Recomputed in
+    full per patch, same rationale as ItemStatistics."""
+
+    __tablename__ = "build_path_statistics"
+    __table_args__ = (
+        UniqueConstraint("patch_id", "champion_id", "role", "purchase_order", "item_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]
+    purchase_order: Mapped[int]
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.item_id"))
+    games: Mapped[int]  # champion+role's total games this patch
+    picks: Mapped[int]  # of those, games where this item was completed at this purchase_order
+    wins: Mapped[int]
+    win_rate: Mapped[float]
+    pick_rate: Mapped[float]
+    sample_size: Mapped[int]
+
+
+class SkillOrderStatistics(Base):
+    """Per (patch, champion, role, level, skill_slot, level_up_type) pick
+    rate, from participants' SKILL_LEVEL_UP timeline events. skill_slot is
+    Riot's 1=Q/2=W/3=E/4=R; level is the champion level the point was spent
+    at, derived from event order (one skill point per level - Riot's raw
+    event carries no level field). level_up_type ('NORMAL' or 'EVOLVE') is
+    part of the unique key since a rare evolve pick (Kled, Rengar, ...) can
+    share a level/slot with a normal pick across different games.
+    Recomputed in full per patch, same rationale as ItemStatistics."""
+
+    __tablename__ = "skill_order_statistics"
+    __table_args__ = (
+        UniqueConstraint(
+            "patch_id", "champion_id", "role", "level", "skill_slot", "level_up_type"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]
+    level: Mapped[int]
+    skill_slot: Mapped[int]
+    level_up_type: Mapped[str]
     games: Mapped[int]
     picks: Mapped[int]
     wins: Mapped[int]

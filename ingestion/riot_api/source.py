@@ -1,10 +1,10 @@
 """Riot API ingestion source: high-ELO ranked-solo match capture, plus the
 derived per-(patch, champion, role) win/pick/ban rate table
 (matchup_statistics), the ally/enemy pairing tables (champion_synergy,
-champion_counters), and final-build item/rune win rates (item_statistics,
-rune_statistics). Purchase order, skill order, and true build paths are
-still deferred - they need the Match-V5 timeline endpoint, not just the
-match summary this module fetches (see docs/architecture.md's known gaps).
+champion_counters), final-build item/rune win rates (item_statistics,
+rune_statistics), and completed-item purchase order / skill leveling order
+(build_path_statistics, skill_order_statistics) from the Match-V5 timeline
+endpoint.
 """
 
 from __future__ import annotations
@@ -20,14 +20,19 @@ from sqlalchemy.orm import Session
 
 from config.settings import RIOT_API
 from db.models import (
+    BuildPathStatistics,
     ChampionCounters,
     ChampionSynergy,
+    Item,
     ItemStatistics,
+    ItemTag,
     Match,
     MatchParticipant,
+    MatchTimeline,
     MatchupStatistics,
     Patch,
     RuneStatistics,
+    SkillOrderStatistics,
 )
 from ingestion.base import IngestionSource
 from ingestion.riot_api import client
@@ -57,13 +62,20 @@ class RiotApiSource(IngestionSource):
                 self.warnings.append(f"Match id lookup failed for a seed summoner: {exc}")
 
         matches = []
+        timelines = []
         for match_id in match_ids:
             try:
                 matches.append(client.fetch_match(match_id))
             except requests.exceptions.RequestException as exc:
                 self.warnings.append(f"Match fetch failed for {match_id}: {exc}")
+                continue  # nothing to attach a timeline to
 
-        return {"matches": matches}
+            try:
+                timelines.append(client.fetch_match_timeline(match_id))
+            except requests.exceptions.RequestException as exc:
+                self.warnings.append(f"Timeline fetch failed for {match_id}: {exc}")
+
+        return {"matches": matches, "timelines": timelines}
 
     def _seed_puuids(self) -> list[str]:
         entries = client.fetch_league_entries()[: RIOT_API.max_seed_summoners]
@@ -156,6 +168,20 @@ class RiotApiSource(IngestionSource):
                 f"version prefix != '{patch_prefix}') and were skipped."
             )
 
+        existing_timeline_ids = set(session.execute(select(MatchTimeline.match_id)).scalars())
+        new_timeline_count = 0
+
+        for timeline_data in data.get("timelines", []):
+            match_id = timeline_data["metadata"]["matchId"]
+            # Only store a timeline for a match that actually has (or now
+            # has) a Match row - an off-patch or otherwise-skipped match
+            # has none, and match_timelines.match_id is FK'd to matches.
+            if match_id in existing_timeline_ids or match_id not in existing_match_ids:
+                continue
+            session.add(MatchTimeline(match_id=match_id, raw_data=timeline_data))
+            existing_timeline_ids.add(match_id)
+            new_timeline_count += 1
+
         session.flush()
 
         if patch_id is not None:
@@ -175,22 +201,43 @@ class RiotApiSource(IngestionSource):
             for participant in patch_participants:
                 participants_by_match[participant.match_id].append(participant)
 
+            patch_timelines = (
+                session.execute(
+                    select(MatchTimeline).where(
+                        MatchTimeline.match_id.in_([m.match_id for m in patch_matches])
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            matches_by_id = {m.match_id: m for m in patch_matches}
+
             stats_count = _recompute_matchup_statistics(session, patch_id, patch_matches, patch_participants)
             synergy_count = _recompute_champion_synergy(session, patch_id, participants_by_match)
             counters_count = _recompute_champion_counters(session, patch_id, participants_by_match)
             item_count = _recompute_item_statistics(session, patch_id, patch_participants)
             rune_count = _recompute_rune_statistics(session, patch_id, patch_participants)
+            build_path_count = _recompute_build_path_statistics(
+                session, patch_id, patch_participants, matches_by_id, patch_timelines
+            )
+            skill_order_count = _recompute_skill_order_statistics(
+                session, patch_id, patch_participants, matches_by_id, patch_timelines
+            )
         else:
             stats_count = synergy_count = counters_count = item_count = rune_count = 0
+            build_path_count = skill_order_count = 0
 
         return {
             "matches": new_match_count,
             "match_participants": new_participant_count,
+            "match_timelines": new_timeline_count,
             "matchup_statistics": stats_count,
             "champion_synergy": synergy_count,
             "champion_counters": counters_count,
             "item_statistics": item_count,
             "rune_statistics": rune_count,
+            "build_path_statistics": build_path_count,
+            "skill_order_statistics": skill_order_count,
         }
 
 
@@ -447,6 +494,207 @@ def _recompute_rune_statistics(
                 wins=bucket["wins"],
                 win_rate=bucket["wins"] / picks,
                 pick_rate=picks / games,
+                sample_size=picks,
+            )
+        )
+
+    return len(buckets)
+
+
+def _terminal_item_ids(session: Session) -> set[int]:
+    """Items that represent a real 'completed' purchase for build-path
+    purposes. Item.depth alone isn't reliable - checked against real data,
+    plenty of genuine components (Long Sword, Boots, Cloth Armor) *and*
+    genuine standalone final items (Doran's items, jungle pets) both have
+    depth=NULL in Data Dragon. The reliable signal is builds_into being
+    empty (nothing upgrades from this item - covers legendaries, tier-2
+    boots that have no further enchant, and 2024+ boot-enchant items alike)
+    combined with excluding item_tags' Consumable/Trinket tags (potions,
+    wards, elixirs also have empty builds_into but aren't a 'build' pick)."""
+
+    excluded_tags = ("Consumable", "Trinket")
+    excluded_ids = set(
+        session.execute(select(ItemTag.item_id).where(ItemTag.tag.in_(excluded_tags))).scalars()
+    )
+    return {
+        item_id
+        for item_id, builds_into in session.execute(select(Item.item_id, Item.builds_into))
+        if not builds_into and item_id not in excluded_ids
+    }
+
+
+def _completed_item_order(
+    events: list[dict], terminal_item_ids: set[int]
+) -> dict[int, list[int]]:
+    """Per participantId, terminal items purchased in chronological order.
+    Nets out a straightforward 'undo the last terminal purchase'
+    (ITEM_UNDO.beforeId matching that participant's most recent recorded
+    item); undoing a sale or an out-of-order undo isn't modeled - known
+    simplification, same spirit as this module's other documented gaps
+    (e.g. ban role attribution)."""
+
+    order: dict[int, list[int]] = defaultdict(list)
+    relevant = (e for e in events if e["type"] in ("ITEM_PURCHASED", "ITEM_UNDO"))
+    for event in sorted(relevant, key=lambda e: e["timestamp"]):
+        participant_id = event["participantId"]
+        if event["type"] == "ITEM_PURCHASED":
+            if event["itemId"] in terminal_item_ids:
+                order[participant_id].append(event["itemId"])
+        else:  # ITEM_UNDO
+            sequence = order.get(participant_id)
+            if sequence and sequence[-1] == event.get("beforeId"):
+                sequence.pop()
+
+    return order
+
+
+def _skill_level_order(events: list[dict]) -> dict[int, list[tuple[int, str]]]:
+    """Per participantId, (skill_slot, level_up_type) in the order the
+    points were spent. The champion level for the Nth entry is N - one
+    skill point is spent per level and Riot's SKILL_LEVEL_UP event carries
+    no level field of its own."""
+
+    by_participant: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
+    for event in events:
+        if event["type"] != "SKILL_LEVEL_UP":
+            continue
+        by_participant[event["participantId"]].append(
+            (event["timestamp"], event["skillSlot"], event.get("levelUpType", "NORMAL"))
+        )
+
+    return {
+        participant_id: [(slot, level_up_type) for _, slot, level_up_type in sorted(entries)]
+        for participant_id, entries in by_participant.items()
+    }
+
+
+def _timeline_events(timeline: MatchTimeline) -> list[dict]:
+    frames = timeline.raw_data["info"].get("frames", [])
+    return [event for frame in frames for event in frame.get("events", [])]
+
+
+def _recompute_build_path_statistics(
+    session: Session,
+    patch_id: int,
+    participants: list[MatchParticipant],
+    matches_by_id: dict[str, Match],
+    timelines: list[MatchTimeline],
+) -> int:
+    """Full recompute, delete-then-reinsert per patch. `games`/`pick_rate`
+    are scoped the same way _recompute_item_statistics's are - total
+    champion+role games this patch (from `participants`, not just games
+    that have a timeline), so a build-path row's pick_rate reads as 'build
+    rate given this champion+role', consistent with item_statistics."""
+
+    session.execute(
+        BuildPathStatistics.__table__.delete().where(BuildPathStatistics.patch_id == patch_id)
+    )
+
+    role_games: dict[tuple[int, str], int] = {}
+    for participant in participants:
+        role_key = (participant.champion_id, participant.team_position)
+        role_games[role_key] = role_games.get(role_key, 0) + 1
+
+    terminal_item_ids = _terminal_item_ids(session)
+    buckets: dict[tuple[int, str, int, int], dict[str, int]] = {}
+
+    for timeline in timelines:
+        match = matches_by_id.get(timeline.match_id)
+        if match is None:
+            continue
+        participants_info = match.raw_data["info"]["participants"]
+        events = _timeline_events(timeline)
+
+        for participant_id, item_sequence in _completed_item_order(
+            events, terminal_item_ids
+        ).items():
+            info = participants_info[participant_id - 1]
+            champion_id = info["championId"]
+            role = info.get("teamPosition", "")
+            win = info["win"]
+            for position, item_id in enumerate(item_sequence[: RIOT_API.build_path_slots], start=1):
+                bucket = buckets.setdefault((champion_id, role, position, item_id), {"picks": 0, "wins": 0})
+                bucket["picks"] += 1
+                bucket["wins"] += int(win)
+
+    for (champion_id, role, position, item_id), bucket in buckets.items():
+        games = role_games.get((champion_id, role), 0)
+        picks = bucket["picks"]
+        session.add(
+            BuildPathStatistics(
+                patch_id=patch_id,
+                champion_id=champion_id,
+                role=role,
+                purchase_order=position,
+                item_id=item_id,
+                games=games,
+                picks=picks,
+                wins=bucket["wins"],
+                win_rate=bucket["wins"] / picks,
+                pick_rate=picks / games if games else 0.0,
+                sample_size=picks,
+            )
+        )
+
+    return len(buckets)
+
+
+def _recompute_skill_order_statistics(
+    session: Session,
+    patch_id: int,
+    participants: list[MatchParticipant],
+    matches_by_id: dict[str, Match],
+    timelines: list[MatchTimeline],
+) -> int:
+    """Full recompute, delete-then-reinsert per patch. Same
+    champion+role-scoped `games`/`pick_rate` convention as
+    _recompute_build_path_statistics/_recompute_item_statistics."""
+
+    session.execute(
+        SkillOrderStatistics.__table__.delete().where(SkillOrderStatistics.patch_id == patch_id)
+    )
+
+    role_games: dict[tuple[int, str], int] = {}
+    for participant in participants:
+        role_key = (participant.champion_id, participant.team_position)
+        role_games[role_key] = role_games.get(role_key, 0) + 1
+
+    buckets: dict[tuple[int, str, int, int, str], dict[str, int]] = {}
+
+    for timeline in timelines:
+        match = matches_by_id.get(timeline.match_id)
+        if match is None:
+            continue
+        participants_info = match.raw_data["info"]["participants"]
+        events = _timeline_events(timeline)
+
+        for participant_id, level_sequence in _skill_level_order(events).items():
+            info = participants_info[participant_id - 1]
+            champion_id = info["championId"]
+            role = info.get("teamPosition", "")
+            win = info["win"]
+            for level, (skill_slot, level_up_type) in enumerate(level_sequence, start=1):
+                key = (champion_id, role, level, skill_slot, level_up_type)
+                bucket = buckets.setdefault(key, {"picks": 0, "wins": 0})
+                bucket["picks"] += 1
+                bucket["wins"] += int(win)
+
+    for (champion_id, role, level, skill_slot, level_up_type), bucket in buckets.items():
+        games = role_games.get((champion_id, role), 0)
+        picks = bucket["picks"]
+        session.add(
+            SkillOrderStatistics(
+                patch_id=patch_id,
+                champion_id=champion_id,
+                role=role,
+                level=level,
+                skill_slot=skill_slot,
+                level_up_type=level_up_type,
+                games=games,
+                picks=picks,
+                wins=bucket["wins"],
+                win_rate=bucket["wins"] / picks,
+                pick_rate=picks / games if games else 0.0,
                 sample_size=picks,
             )
         )
