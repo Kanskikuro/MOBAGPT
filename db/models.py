@@ -1,8 +1,8 @@
 """Knowledge-database schema (Component 1 of docs/sepc.md), plus the
 statistical DB schema (Component 2): Match, MatchParticipant,
 MatchupStatistics, ChampionSynergy, ChampionCounters, ItemStatistics,
-RuneStatistics, MatchTimeline, BuildPathStatistics, SkillOrderStatistics,
-all populated by ingestion/riot_api.
+ItemCounterStatistics, RuneStatistics, MatchTimeline, BuildPathStatistics,
+SkillOrderStatistics, all populated by ingestion/riot_api.
 
 The OTP DB tables (otp_builds, otp_players, evaluation_runs) live in the
 same physical SQLite file per docs/sepc.md's "Database" section, but are
@@ -484,6 +484,43 @@ class ItemStatistics(Base):
     wins: Mapped[int]
     win_rate: Mapped[float]  # wins / picks
     pick_rate: Mapped[float]  # picks / games - "build rate" given champion+role
+    sample_size: Mapped[int]  # == picks
+
+
+class ItemCounterStatistics(Base):
+    """'Itemization counters': per (patch, champion+role, item,
+    enemy_champion+enemy_role) win rate - i.e. how a specific final-build
+    item performed for a champion+role specifically against a specific
+    enemy matchup, not just in aggregate. Combines ChampionCounters'
+    opponent-pairing logic (same win-mismatch-within-match rule, same
+    two-opposing-sides assumption) with ItemStatistics' final-build reading
+    (item0-item5; item6/trinket excluded). `games`/`pick_rate` are scoped
+    to the matchup itself (this champion+role's games against this specific
+    enemy_champion+role this patch, i.e. the same denominator
+    ChampionCounters.games uses) rather than the champion+role's total
+    patch games, so pick_rate reads as 'build rate given this specific
+    matchup'. Recomputed in full per patch, same rationale as
+    ItemStatistics/ChampionCounters."""
+
+    __tablename__ = "item_counter_statistics"
+    __table_args__ = (
+        UniqueConstraint(
+            "patch_id", "champion_id", "role", "item_id", "enemy_champion_id", "enemy_role"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.item_id"))
+    enemy_champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    enemy_role: Mapped[str]
+    games: Mapped[int]  # this champion+role's games against this specific enemy matchup
+    picks: Mapped[int]  # of those, games where this item was in the final build
+    wins: Mapped[int]
+    win_rate: Mapped[float]  # wins / picks
+    pick_rate: Mapped[float]  # picks / games - "build rate" given this specific matchup
     sample_size: Mapped[int]  # == picks
 
 

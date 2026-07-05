@@ -2,9 +2,10 @@
 derived per-(patch, champion, role) win/pick/ban rate table
 (matchup_statistics), the ally/enemy pairing tables (champion_synergy,
 champion_counters), final-build item/rune win rates (item_statistics,
-rune_statistics), and completed-item purchase order / skill leveling order
-(build_path_statistics, skill_order_statistics) from the Match-V5 timeline
-endpoint.
+rune_statistics), per-matchup "itemization counter" win rates
+(item_counter_statistics), and completed-item purchase order / skill
+leveling order (build_path_statistics, skill_order_statistics) from the
+Match-V5 timeline endpoint.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from db.models import (
     ChampionCounters,
     ChampionSynergy,
     Item,
+    ItemCounterStatistics,
     ItemStatistics,
     ItemTag,
     Match,
@@ -217,6 +219,9 @@ class RiotApiSource(IngestionSource):
             counters_count = _recompute_champion_counters(session, patch_id, participants_by_match)
             item_count = _recompute_item_statistics(session, patch_id, patch_participants)
             rune_count = _recompute_rune_statistics(session, patch_id, patch_participants)
+            item_counter_count = _recompute_item_counter_statistics(
+                session, patch_id, participants_by_match
+            )
             build_path_count = _recompute_build_path_statistics(
                 session, patch_id, patch_participants, matches_by_id, patch_timelines
             )
@@ -225,7 +230,7 @@ class RiotApiSource(IngestionSource):
             )
         else:
             stats_count = synergy_count = counters_count = item_count = rune_count = 0
-            build_path_count = skill_order_count = 0
+            item_counter_count = build_path_count = skill_order_count = 0
 
         return {
             "matches": new_match_count,
@@ -236,6 +241,7 @@ class RiotApiSource(IngestionSource):
             "champion_counters": counters_count,
             "item_statistics": item_count,
             "rune_statistics": rune_count,
+            "item_counter_statistics": item_counter_count,
             "build_path_statistics": build_path_count,
             "skill_order_statistics": skill_order_count,
         }
@@ -435,6 +441,68 @@ def _recompute_item_statistics(
                 champion_id=champion_id,
                 role=role,
                 item_id=item_id,
+                games=games,
+                picks=picks,
+                wins=bucket["wins"],
+                win_rate=bucket["wins"] / picks,
+                pick_rate=picks / games,
+                sample_size=picks,
+            )
+        )
+
+    return len(buckets)
+
+
+def _recompute_item_counter_statistics(
+    session: Session,
+    patch_id: int,
+    participants_by_match: dict[str, list[MatchParticipant]],
+) -> int:
+    """Full recompute, delete-then-reinsert per patch. "Itemization
+    counters" - combines _recompute_champion_counters' opponent-pairing
+    (same win-mismatch-within-match rule, same two-opposing-sides
+    assumption) with _recompute_item_statistics' final-build reading
+    (item0..item5; item6/trinket excluded). Unlike ItemStatistics, `games`
+    is this champion+role's game count against this *specific*
+    enemy_champion+role (the same denominator ChampionCounters.games
+    uses), not the champion+role's total patch games - so `pick_rate`
+    reads as "build rate given this specific matchup"."""
+
+    session.execute(
+        ItemCounterStatistics.__table__.delete().where(ItemCounterStatistics.patch_id == patch_id)
+    )
+
+    matchup_games: dict[tuple[int, str, int, str], int] = {}
+    buckets: dict[tuple[int, str, int, int, str], dict[str, int]] = {}
+
+    for participants in participants_by_match.values():
+        for p, q in itertools.product(participants, repeat=2):
+            if q.win is p.win:
+                continue  # teammate or self, not an opponent
+
+            matchup_key = (p.champion_id, p.team_position, q.champion_id, q.team_position)
+            matchup_games[matchup_key] = matchup_games.get(matchup_key, 0) + 1
+
+            for slot in range(6):  # item0..item5; item6 (trinket) excluded
+                item_id = p.raw_data.get(f"item{slot}", 0)
+                if item_id <= 0:
+                    continue
+                key = (p.champion_id, p.team_position, item_id, q.champion_id, q.team_position)
+                bucket = buckets.setdefault(key, {"picks": 0, "wins": 0})
+                bucket["picks"] += 1
+                bucket["wins"] += int(p.win)
+
+    for (champion_id, role, item_id, enemy_champion_id, enemy_role), bucket in buckets.items():
+        games = matchup_games[(champion_id, role, enemy_champion_id, enemy_role)]
+        picks = bucket["picks"]
+        session.add(
+            ItemCounterStatistics(
+                patch_id=patch_id,
+                champion_id=champion_id,
+                role=role,
+                item_id=item_id,
+                enemy_champion_id=enemy_champion_id,
+                enemy_role=enemy_role,
                 games=games,
                 picks=picks,
                 wins=bucket["wins"],

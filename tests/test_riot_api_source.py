@@ -7,6 +7,7 @@ from db.models import (
     ChampionCounters,
     ChampionSynergy,
     Item,
+    ItemCounterStatistics,
     ItemStatistics,
     ItemTag,
     Match,
@@ -219,6 +220,7 @@ def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) ->
         # _participant defaults to no items/runes selected.
         "item_statistics": 0,
         "rune_statistics": 0,
+        "item_counter_statistics": 0,
         "build_path_statistics": 0,
         "skill_order_statistics": 0,
     }
@@ -235,6 +237,7 @@ def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) ->
         "champion_counters": 2,
         "item_statistics": 0,
         "rune_statistics": 0,
+        "item_counter_statistics": 0,
         "build_path_statistics": 0,
         "skill_order_statistics": 0,
     }
@@ -283,6 +286,7 @@ def test_load_skips_off_patch_matches(session: Session) -> None:
         "champion_counters": 0,
         "item_statistics": 0,
         "rune_statistics": 0,
+        "item_counter_statistics": 0,
         "build_path_statistics": 0,
         "skill_order_statistics": 0,
     }
@@ -302,6 +306,7 @@ def test_load_without_ingested_patch_warns_and_skips_statistics(session: Session
     assert counts["champion_counters"] == 0
     assert counts["item_statistics"] == 0
     assert counts["rune_statistics"] == 0
+    assert counts["item_counter_statistics"] == 0
     assert counts["build_path_statistics"] == 0
     assert counts["skill_order_statistics"] == 0
     assert any("not found in DB" in warning for warning in source.warnings)
@@ -486,6 +491,44 @@ def test_item_statistics_pick_and_win_rate(session: Session) -> None:
     assert row.item_id == RABADONS
     assert row.games == 2  # AHRI/MIDDLE played twice this patch
     assert row.picks == 2  # built both times
+    assert row.wins == 1
+    assert row.win_rate == 0.5
+    assert row.pick_rate == 1.0
+
+
+def test_item_counter_statistics_scoped_to_specific_matchup(session: Session) -> None:
+    session.add(Patch(version="14.14.1"))
+    session.commit()
+
+    payload = {
+        "matches": [
+            _item_rune_match("NA1_1", "14.14.567890", True),  # AHRI (RABADONS) vs ZED, win
+            _item_rune_match("NA1_2", "14.14.567891", False),  # AHRI (RABADONS) vs ZED, loss
+            # A third game against a different enemy, no items recorded -
+            # must not inflate the ZED matchup's denominator below, and
+            # produces no row of its own (no item ever built).
+            _match("NA1_3", "14.14.567892", AHRI, YONE, True),
+        ]
+    }
+
+    source = RiotApiSource()
+    source.warnings = []
+    counts = source.load(session, "14.14.1", payload)
+
+    assert counts["item_counter_statistics"] == 1
+    rows = session.execute(select(ItemCounterStatistics)).scalars().all()
+    assert len(rows) == 1
+
+    row = rows[0]
+    assert row.champion_id == AHRI
+    assert row.role == "MIDDLE"
+    assert row.item_id == RABADONS
+    assert row.enemy_champion_id == ZED
+    assert row.enemy_role == "MIDDLE"
+    # AHRI/MIDDLE faced ZED/MIDDLE twice this patch - the separate YONE
+    # matchup must not be folded into this row's denominator.
+    assert row.games == 2
+    assert row.picks == 2
     assert row.wins == 1
     assert row.win_rate == 0.5
     assert row.pick_rate == 1.0
