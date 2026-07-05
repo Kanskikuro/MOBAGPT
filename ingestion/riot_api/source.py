@@ -1,13 +1,15 @@
 """Riot API ingestion source: high-ELO ranked-solo match capture, plus the
 derived per-(patch, champion, role) win/pick/ban rate table
-(matchup_statistics). First slice of Component 2 (docs/sepc.md) -
-champion_synergy/champion_counters, build paths, and rune/item/skill-order
-stats are deferred (see docs/architecture.md's known gaps).
+(matchup_statistics) and the ally/enemy pairing tables (champion_synergy,
+champion_counters). Build paths and rune/item/skill-order stats are still
+deferred (see docs/architecture.md's known gaps).
 """
 
 from __future__ import annotations
 
 import datetime
+import itertools
+from collections import defaultdict
 from typing import Any
 
 import requests
@@ -15,7 +17,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from config.settings import RIOT_API
-from db.models import Match, MatchParticipant, MatchupStatistics, Patch
+from db.models import (
+    ChampionCounters,
+    ChampionSynergy,
+    Match,
+    MatchParticipant,
+    MatchupStatistics,
+    Patch,
+)
 from ingestion.base import IngestionSource
 from ingestion.riot_api import client
 from ingestion.riot_api.identity import extract_puuid
@@ -145,12 +154,35 @@ class RiotApiSource(IngestionSource):
 
         session.flush()
 
-        stats_count = _recompute_matchup_statistics(session, patch_id) if patch_id is not None else 0
+        if patch_id is not None:
+            patch_matches = session.execute(
+                select(Match).where(Match.patch_id == patch_id)
+            ).scalars().all()
+            patch_participants = (
+                session.execute(
+                    select(MatchParticipant).where(
+                        MatchParticipant.match_id.in_([m.match_id for m in patch_matches])
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            participants_by_match: dict[str, list[MatchParticipant]] = defaultdict(list)
+            for participant in patch_participants:
+                participants_by_match[participant.match_id].append(participant)
+
+            stats_count = _recompute_matchup_statistics(session, patch_id, patch_matches, patch_participants)
+            synergy_count = _recompute_champion_synergy(session, patch_id, participants_by_match)
+            counters_count = _recompute_champion_counters(session, patch_id, participants_by_match)
+        else:
+            stats_count = synergy_count = counters_count = 0
 
         return {
             "matches": new_match_count,
             "match_participants": new_participant_count,
             "matchup_statistics": stats_count,
+            "champion_synergy": synergy_count,
+            "champion_counters": counters_count,
         }
 
 
@@ -158,7 +190,12 @@ def _major_minor(version: str) -> str:
     return ".".join(version.split(".")[:2])
 
 
-def _recompute_matchup_statistics(session: Session, patch_id: int) -> int:
+def _recompute_matchup_statistics(
+    session: Session,
+    patch_id: int,
+    matches: list[Match],
+    participants: list[MatchParticipant],
+) -> int:
     """Full recompute from match_participants/matches for this patch - a
     derived aggregate, not a natural upsert, so it's deleted-and-reinserted
     rather than incrementally merged (same rationale as
@@ -168,12 +205,9 @@ def _recompute_matchup_statistics(session: Session, patch_id: int) -> int:
         MatchupStatistics.__table__.delete().where(MatchupStatistics.patch_id == patch_id)
     )
 
-    matches = session.execute(select(Match).where(Match.patch_id == patch_id)).scalars().all()
     total_games = len(matches)
     if total_games == 0:
         return 0
-
-    match_ids = [m.match_id for m in matches]
 
     # Bans have no role attribution in Riot's data (a ban happens before
     # role assignment) - counted per champion for the patch, then the same
@@ -185,12 +219,6 @@ def _recompute_matchup_statistics(session: Session, patch_id: int) -> int:
                 champion_id = ban.get("championId", -1)
                 if champion_id > 0:
                     ban_counts[champion_id] = ban_counts.get(champion_id, 0) + 1
-
-    participants = (
-        session.execute(select(MatchParticipant).where(MatchParticipant.match_id.in_(match_ids)))
-        .scalars()
-        .all()
-    )
 
     role_stats: dict[tuple[int, str], dict[str, int]] = {}
     for participant in participants:
@@ -225,3 +253,92 @@ def _recompute_matchup_statistics(session: Session, patch_id: int) -> int:
         row_count += 1
 
     return row_count
+
+
+def _recompute_champion_synergy(
+    session: Session,
+    patch_id: int,
+    participants_by_match: dict[str, list[MatchParticipant]],
+) -> int:
+    """Full recompute, delete-then-reinsert per patch (same rationale as
+    _recompute_matchup_statistics). Teammates are found via `win` rather
+    than the raw `teamId` in raw_data: queue 420 (ranked solo/duo, the only
+    queue this source ingests) always has exactly two opposing sides with
+    `win` uniform within a side, so same win value in the same match =
+    teammates. This assumption would break for a non-two-team queue (e.g.
+    Arena) - not in scope."""
+
+    session.execute(ChampionSynergy.__table__.delete().where(ChampionSynergy.patch_id == patch_id))
+
+    pairs: dict[tuple[int, str, int, str], dict[str, int]] = {}
+    for participants in participants_by_match.values():
+        for side in (True, False):
+            teammates = [p for p in participants if p.win is side]
+            for p1, p2 in itertools.combinations(teammates, 2):
+                a, b = sorted((p1, p2), key=lambda p: p.champion_id)
+                key = (a.champion_id, a.team_position, b.champion_id, b.team_position)
+                bucket = pairs.setdefault(key, {"games": 0, "wins": 0})
+                bucket["games"] += 1
+                bucket["wins"] += int(side)
+
+    for (champion_id_a, role_a, champion_id_b, role_b), bucket in pairs.items():
+        games = bucket["games"]
+        session.add(
+            ChampionSynergy(
+                patch_id=patch_id,
+                champion_id_a=champion_id_a,
+                role_a=role_a,
+                champion_id_b=champion_id_b,
+                role_b=role_b,
+                games=games,
+                wins=bucket["wins"],
+                win_rate=bucket["wins"] / games,
+                sample_size=games,
+            )
+        )
+
+    return len(pairs)
+
+
+def _recompute_champion_counters(
+    session: Session,
+    patch_id: int,
+    participants_by_match: dict[str, list[MatchParticipant]],
+) -> int:
+    """Full recompute, delete-then-reinsert per patch. Directional: both
+    (A vs B) and (B vs A) rows are stored explicitly (see ChampionCounters
+    docstring) rather than requiring a reverse-lookup convention downstream.
+    Opponents are found via `win` mismatch within the same match - same
+    caveat as _recompute_champion_synergy."""
+
+    session.execute(
+        ChampionCounters.__table__.delete().where(ChampionCounters.patch_id == patch_id)
+    )
+
+    pairs: dict[tuple[int, str, int, str], dict[str, int]] = {}
+    for participants in participants_by_match.values():
+        for p, q in itertools.product(participants, repeat=2):
+            if q.win is p.win:
+                continue  # teammate or self, not an opponent
+            key = (p.champion_id, p.team_position, q.champion_id, q.team_position)
+            bucket = pairs.setdefault(key, {"games": 0, "wins": 0})
+            bucket["games"] += 1
+            bucket["wins"] += int(p.win)
+
+    for (champion_id, role, enemy_champion_id, enemy_role), bucket in pairs.items():
+        games = bucket["games"]
+        session.add(
+            ChampionCounters(
+                patch_id=patch_id,
+                champion_id=champion_id,
+                role=role,
+                enemy_champion_id=enemy_champion_id,
+                enemy_role=enemy_role,
+                games=games,
+                wins=bucket["wins"],
+                win_rate=bucket["wins"] / games,
+                sample_size=games,
+            )
+        )
+
+    return len(pairs)

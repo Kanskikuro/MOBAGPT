@@ -1,9 +1,9 @@
-"""Knowledge-database schema (Component 1 of docs/sepc.md), plus the first
-slice of the statistical DB schema (Component 2): Match, MatchParticipant,
-MatchupStatistics, populated by ingestion/riot_api.
+"""Knowledge-database schema (Component 1 of docs/sepc.md), plus the
+statistical DB schema (Component 2): Match, MatchParticipant,
+MatchupStatistics, ChampionSynergy, ChampionCounters, all populated by
+ingestion/riot_api.
 
-Remaining statistical DB tables (champion_synergy, champion_counters) and
-the OTP DB tables (otp_builds, otp_players, evaluation_runs) live in the
+The OTP DB tables (otp_builds, otp_players, evaluation_runs) live in the
 same physical SQLite file per docs/sepc.md's "Database" section, but are
 added in a later migration when that ingestion exists. The model/inference
 boundary is enforced by which query-layer module callers import (see
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import JSON, ForeignKey, UniqueConstraint
+from sqlalchemy import JSON, CheckConstraint, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -411,4 +411,54 @@ class MatchupStatistics(Base):
     win_rate: Mapped[float]
     pick_rate: Mapped[float]
     ban_rate: Mapped[float]
+    sample_size: Mapped[int]
+
+
+class ChampionSynergy(Base):
+    """Symmetric ally-pair win rate per (patch, champion+role, champion+role),
+    per docs/sepc.md Component 2. Canonicalized champion_id_a < champion_id_b
+    so a pair is stored once rather than twice. Recomputed in full on every
+    ingestion/riot_api run, same rationale as MatchupStatistics: a derived
+    aggregate, not a natural upsert."""
+
+    __tablename__ = "champion_synergy"
+    __table_args__ = (
+        UniqueConstraint("patch_id", "champion_id_a", "role_a", "champion_id_b", "role_b"),
+        CheckConstraint("champion_id_a < champion_id_b"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id_a: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role_a: Mapped[str]
+    champion_id_b: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role_b: Mapped[str]
+    games: Mapped[int]
+    wins: Mapped[int]  # times this pair was on the winning side together
+    win_rate: Mapped[float]
+    sample_size: Mapped[int]
+
+
+class ChampionCounters(Base):
+    """Directional: how champion+role performs specifically against
+    enemy_champion+enemy_role, per docs/sepc.md Component 2. Not symmetric -
+    the reverse pairing is a separate row (derivable from the same match set,
+    but stored explicitly so training code never needs a reverse-lookup
+    rule). Recomputed in full on every ingestion/riot_api run, same
+    rationale as MatchupStatistics."""
+
+    __tablename__ = "champion_counters"
+    __table_args__ = (
+        UniqueConstraint("patch_id", "champion_id", "role", "enemy_champion_id", "enemy_role"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]
+    enemy_champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    enemy_role: Mapped[str]
+    games: Mapped[int]
+    wins: Mapped[int]
+    win_rate: Mapped[float]
     sample_size: Mapped[int]
