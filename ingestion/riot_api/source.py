@@ -1,8 +1,10 @@
 """Riot API ingestion source: high-ELO ranked-solo match capture, plus the
 derived per-(patch, champion, role) win/pick/ban rate table
-(matchup_statistics) and the ally/enemy pairing tables (champion_synergy,
-champion_counters). Build paths and rune/item/skill-order stats are still
-deferred (see docs/architecture.md's known gaps).
+(matchup_statistics), the ally/enemy pairing tables (champion_synergy,
+champion_counters), and final-build item/rune win rates (item_statistics,
+rune_statistics). Purchase order, skill order, and true build paths are
+still deferred - they need the Match-V5 timeline endpoint, not just the
+match summary this module fetches (see docs/architecture.md's known gaps).
 """
 
 from __future__ import annotations
@@ -20,10 +22,12 @@ from config.settings import RIOT_API
 from db.models import (
     ChampionCounters,
     ChampionSynergy,
+    ItemStatistics,
     Match,
     MatchParticipant,
     MatchupStatistics,
     Patch,
+    RuneStatistics,
 )
 from ingestion.base import IngestionSource
 from ingestion.riot_api import client
@@ -174,8 +178,10 @@ class RiotApiSource(IngestionSource):
             stats_count = _recompute_matchup_statistics(session, patch_id, patch_matches, patch_participants)
             synergy_count = _recompute_champion_synergy(session, patch_id, participants_by_match)
             counters_count = _recompute_champion_counters(session, patch_id, participants_by_match)
+            item_count = _recompute_item_statistics(session, patch_id, patch_participants)
+            rune_count = _recompute_rune_statistics(session, patch_id, patch_participants)
         else:
-            stats_count = synergy_count = counters_count = 0
+            stats_count = synergy_count = counters_count = item_count = rune_count = 0
 
         return {
             "matches": new_match_count,
@@ -183,6 +189,8 @@ class RiotApiSource(IngestionSource):
             "matchup_statistics": stats_count,
             "champion_synergy": synergy_count,
             "champion_counters": counters_count,
+            "item_statistics": item_count,
+            "rune_statistics": rune_count,
         }
 
 
@@ -342,3 +350,105 @@ def _recompute_champion_counters(
         )
 
     return len(pairs)
+
+
+def _recompute_item_statistics(
+    session: Session, patch_id: int, participants: list[MatchParticipant]
+) -> int:
+    """Full recompute, delete-then-reinsert per patch. Final build only -
+    item0..item5 (item6/trinket excluded, near-uniform per role and not
+    informative for build comparison). `games` is champion+role's own game
+    count this patch (not the total patch game count matchup_statistics
+    uses), since `pick_rate` here means "build rate given this champion+role",
+    not "share of all role slots patch-wide"."""
+
+    session.execute(ItemStatistics.__table__.delete().where(ItemStatistics.patch_id == patch_id))
+
+    role_games: dict[tuple[int, str], int] = {}
+    buckets: dict[tuple[int, str, int], dict[str, int]] = {}
+    for participant in participants:
+        role_key = (participant.champion_id, participant.team_position)
+        role_games[role_key] = role_games.get(role_key, 0) + 1
+
+        for slot in range(6):  # item0..item5; item6 (trinket) excluded
+            item_id = participant.raw_data.get(f"item{slot}", 0)
+            if item_id <= 0:
+                continue
+            key = (participant.champion_id, participant.team_position, item_id)
+            bucket = buckets.setdefault(key, {"picks": 0, "wins": 0})
+            bucket["picks"] += 1
+            bucket["wins"] += int(participant.win)
+
+    for (champion_id, role, item_id), bucket in buckets.items():
+        games = role_games[(champion_id, role)]
+        picks = bucket["picks"]
+        session.add(
+            ItemStatistics(
+                patch_id=patch_id,
+                champion_id=champion_id,
+                role=role,
+                item_id=item_id,
+                games=games,
+                picks=picks,
+                wins=bucket["wins"],
+                win_rate=bucket["wins"] / picks,
+                pick_rate=picks / games,
+                sample_size=picks,
+            )
+        )
+
+    return len(buckets)
+
+
+def _recompute_rune_statistics(
+    session: Session, patch_id: int, participants: list[MatchParticipant]
+) -> int:
+    """Full recompute, delete-then-reinsert per patch. Covers both rune
+    paths' selections (6 total per participant); stat-shard perks
+    (statPerks.offense/flex/defense) are excluded - see RuneStatistics
+    docstring. `games`/`pick_rate` follow the same champion+role-scoped
+    convention as _recompute_item_statistics."""
+
+    session.execute(RuneStatistics.__table__.delete().where(RuneStatistics.patch_id == patch_id))
+
+    role_games: dict[tuple[int, str], int] = {}
+    buckets: dict[tuple[int, str, int], dict[str, int]] = {}
+    keystone_ids: set[int] = set()
+
+    for participant in participants:
+        role_key = (participant.champion_id, participant.team_position)
+        role_games[role_key] = role_games.get(role_key, 0) + 1
+
+        styles = participant.raw_data.get("perks", {}).get("styles", [])
+        for style_index, style in enumerate(styles):
+            for selection_index, selection in enumerate(style.get("selections", [])):
+                rune_id = selection.get("perk")
+                if not rune_id:
+                    continue
+                if style_index == 0 and selection_index == 0:
+                    keystone_ids.add(rune_id)
+                key = (participant.champion_id, participant.team_position, rune_id)
+                bucket = buckets.setdefault(key, {"picks": 0, "wins": 0})
+                bucket["picks"] += 1
+                bucket["wins"] += int(participant.win)
+
+    for (champion_id, role, rune_id), bucket in buckets.items():
+        games = role_games[(champion_id, role)]
+        picks = bucket["picks"]
+        session.add(
+            RuneStatistics(
+                patch_id=patch_id,
+                champion_id=champion_id,
+                role=role,
+                rune_id=rune_id,
+                is_keystone=rune_id in keystone_ids,
+                games=games,
+                picks=picks,
+                wins=bucket["wins"],
+                win_rate=bucket["wins"] / picks,
+                pick_rate=picks / games,
+                sample_size=picks,
+            )
+        )
+
+    return len(buckets)

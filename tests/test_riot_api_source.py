@@ -4,10 +4,12 @@ from sqlalchemy.orm import Session
 from db.models import (
     ChampionCounters,
     ChampionSynergy,
+    ItemStatistics,
     Match,
     MatchParticipant,
     MatchupStatistics,
     Patch,
+    RuneStatistics,
 )
 from ingestion.riot_api import client
 from ingestion.riot_api.source import RiotApiSource
@@ -21,8 +23,16 @@ LEONA = 89
 VI = 254
 
 
-def _participant(champion_id: int, team_position: str, win: bool) -> dict:
-    return {
+def _participant(
+    champion_id: int,
+    team_position: str,
+    win: bool,
+    items: list[int] | None = None,
+    primary_runes: list[int] | None = None,
+    sub_runes: list[int] | None = None,
+) -> dict:
+    items = items or []
+    participant = {
         "championId": champion_id,
         "teamPosition": team_position,
         "win": win,
@@ -31,6 +41,15 @@ def _participant(champion_id: int, team_position: str, win: bool) -> dict:
         "assists": 7,
         "puuid": "p",
     }
+    for slot in range(7):  # item0..item6 (item6 is the trinket slot)
+        participant[f"item{slot}"] = items[slot] if slot < len(items) else 0
+    participant["perks"] = {
+        "styles": [
+            {"selections": [{"perk": rune_id} for rune_id in (primary_runes or [])]},
+            {"selections": [{"perk": rune_id} for rune_id in (sub_runes or [])]},
+        ]
+    }
+    return participant
 
 
 def _match(
@@ -152,6 +171,9 @@ def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) ->
         # AHRI/ZED face each other in both matches (win alternates), giving
         # both directional rows (AHRI->ZED, ZED->AHRI).
         "champion_counters": 2,
+        # _participant defaults to no items/runes selected.
+        "item_statistics": 0,
+        "rune_statistics": 0,
     }
     # Re-running with the same fetched matches must not create duplicates -
     # matchup_statistics/champion_synergy/champion_counters are still
@@ -163,6 +185,8 @@ def test_load_is_idempotent_and_computes_matchup_statistics(session: Session) ->
         "matchup_statistics": 2,
         "champion_synergy": 0,
         "champion_counters": 2,
+        "item_statistics": 0,
+        "rune_statistics": 0,
     }
 
     assert len(session.execute(select(Match)).scalars().all()) == 2
@@ -206,6 +230,8 @@ def test_load_skips_off_patch_matches(session: Session) -> None:
         "matchup_statistics": 0,
         "champion_synergy": 0,
         "champion_counters": 0,
+        "item_statistics": 0,
+        "rune_statistics": 0,
     }
     assert session.execute(select(Match)).scalars().all() == []
     assert any("off-patch" in warning for warning in source.warnings)
@@ -221,6 +247,8 @@ def test_load_without_ingested_patch_warns_and_skips_statistics(session: Session
     assert counts["matchup_statistics"] == 0
     assert counts["champion_synergy"] == 0
     assert counts["champion_counters"] == 0
+    assert counts["item_statistics"] == 0
+    assert counts["rune_statistics"] == 0
     assert any("not found in DB" in warning for warning in source.warnings)
     match = session.execute(select(Match).where(Match.match_id == "NA1_1")).scalar_one()
     assert match.patch_id is None
@@ -336,3 +364,117 @@ def test_champion_synergy_and_counters_are_idempotent(session: Session) -> None:
     assert counts["champion_counters"] == 4
     assert len(session.execute(select(ChampionSynergy)).scalars().all()) == 1
     assert len(session.execute(select(ChampionCounters)).scalars().all()) == 4
+
+
+RABADONS = 3089
+STOPWATCH_TRINKET = 3364
+ELECTROCUTE = 8112
+TASTE_OF_BLOOD = 8126
+CHEAP_SHOT = 8143
+
+
+def _item_rune_match(match_id: str, game_version: str, win: bool) -> dict:
+    """One AHRI/MIDDLE participant with a fixed item build (including a
+    trinket in item6) and rune page, vs. a bare ZED/MIDDLE opponent with no
+    items/runes set - isolates what's being asserted to the ally side."""
+    return {
+        "metadata": {"matchId": match_id},
+        "info": {
+            "gameCreation": 1720000000000,
+            "gameDuration": 1800,
+            "gameVersion": game_version,
+            "queueId": 420,
+            "teams": [
+                {"teamId": 100, "win": win, "bans": []},
+                {"teamId": 200, "win": not win, "bans": []},
+            ],
+            "participants": [
+                _participant(
+                    AHRI,
+                    "MIDDLE",
+                    win,
+                    items=[RABADONS, 0, 0, 0, 0, 0] + [STOPWATCH_TRINKET],
+                    primary_runes=[ELECTROCUTE, TASTE_OF_BLOOD, CHEAP_SHOT],
+                    sub_runes=[8009],
+                ),
+                _participant(ZED, "MIDDLE", not win),
+            ],
+        },
+    }
+
+
+def test_item_statistics_pick_and_win_rate(session: Session) -> None:
+    session.add(Patch(version="14.14.1"))
+    session.commit()
+
+    payload = {
+        "matches": [
+            _item_rune_match("NA1_1", "14.14.567890", True),
+            _item_rune_match("NA1_2", "14.14.567891", False),
+        ]
+    }
+
+    source = RiotApiSource()
+    source.warnings = []
+    counts = source.load(session, "14.14.1", payload)
+
+    # Only Rabadon's (item0) produces a row - item6 is the trinket slot,
+    # deliberately excluded regardless of what's in it.
+    assert counts["item_statistics"] == 1
+    rows = session.execute(select(ItemStatistics)).scalars().all()
+    assert len(rows) == 1
+    assert all(row.item_id != STOPWATCH_TRINKET for row in rows)
+
+    row = rows[0]
+    assert row.champion_id == AHRI
+    assert row.role == "MIDDLE"
+    assert row.item_id == RABADONS
+    assert row.games == 2  # AHRI/MIDDLE played twice this patch
+    assert row.picks == 2  # built both times
+    assert row.wins == 1
+    assert row.win_rate == 0.5
+    assert row.pick_rate == 1.0
+
+
+def test_rune_statistics_pick_win_rate_and_keystone_flag(session: Session) -> None:
+    session.add(Patch(version="14.14.1"))
+    session.commit()
+
+    payload = {"matches": [_item_rune_match("NA1_1", "14.14.567890", True)]}
+
+    source = RiotApiSource()
+    source.warnings = []
+    counts = source.load(session, "14.14.1", payload)
+
+    assert counts["rune_statistics"] == 4  # 3 primary-path + 1 secondary-path selection
+    rows = {r.rune_id: r for r in session.execute(select(RuneStatistics)).scalars().all()}
+
+    assert rows[ELECTROCUTE].is_keystone is True
+    assert rows[TASTE_OF_BLOOD].is_keystone is False
+    assert rows[CHEAP_SHOT].is_keystone is False
+    assert rows[8009].is_keystone is False
+    for row in rows.values():
+        assert row.champion_id == AHRI
+        assert row.role == "MIDDLE"
+        assert row.games == 1
+        assert row.picks == 1
+        assert row.win_rate == 1.0
+
+
+def test_item_and_rune_statistics_ignore_participants_with_nothing_selected(
+    session: Session,
+) -> None:
+    """_participant defaults items/runes to empty - a participant that never
+    specifies a build must not produce any item_statistics/rune_statistics
+    rows (covers the existing-test-compatibility default path explicitly)."""
+    session.add(Patch(version="14.14.1"))
+    session.commit()
+
+    payload = {"matches": [_match("NA1_1", "14.14.567890", AHRI, ZED, True)]}
+
+    source = RiotApiSource()
+    source.warnings = []
+    counts = source.load(session, "14.14.1", payload)
+
+    assert counts["item_statistics"] == 0
+    assert counts["rune_statistics"] == 0

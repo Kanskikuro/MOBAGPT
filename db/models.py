@@ -1,7 +1,7 @@
 """Knowledge-database schema (Component 1 of docs/sepc.md), plus the
 statistical DB schema (Component 2): Match, MatchParticipant,
-MatchupStatistics, ChampionSynergy, ChampionCounters, all populated by
-ingestion/riot_api.
+MatchupStatistics, ChampionSynergy, ChampionCounters, ItemStatistics,
+RuneStatistics, all populated by ingestion/riot_api.
 
 The OTP DB tables (otp_builds, otp_players, evaluation_runs) live in the
 same physical SQLite file per docs/sepc.md's "Database" section, but are
@@ -461,4 +461,51 @@ class ChampionCounters(Base):
     games: Mapped[int]
     wins: Mapped[int]
     win_rate: Mapped[float]
+    sample_size: Mapped[int]
+
+
+class ItemStatistics(Base):
+    """Per (patch, champion, role, item) win rate, from participants' final
+    item builds (item0-item5; item6/trinket excluded - near-uniform per
+    role, not informative for build comparison). Recomputed in full per
+    patch, same rationale as MatchupStatistics."""
+
+    __tablename__ = "item_statistics"
+    __table_args__ = (UniqueConstraint("patch_id", "champion_id", "role", "item_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.item_id"))
+    games: Mapped[int]  # champion+role's total games this patch
+    picks: Mapped[int]  # of those, games where this item was in the final build
+    wins: Mapped[int]
+    win_rate: Mapped[float]  # wins / picks
+    pick_rate: Mapped[float]  # picks / games - "build rate" given champion+role
+    sample_size: Mapped[int]  # == picks
+
+
+class RuneStatistics(Base):
+    """Per (patch, champion, role, rune) win rate, from participants'
+    selected runes (both primary and secondary paths, 6 selections total).
+    Stat-shard perks (statPerks.offense/flex/defense, e.g. 5008/5002/5001)
+    are NOT included - Data Dragon's rune tree (what populates the `runes`
+    table) has no entries for them at all, so there's no Rune row to key
+    against; tracked as a known gap, not solved here."""
+
+    __tablename__ = "rune_statistics"
+    __table_args__ = (UniqueConstraint("patch_id", "champion_id", "role", "rune_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]
+    rune_id: Mapped[int] = mapped_column(ForeignKey("runes.rune_id"))
+    is_keystone: Mapped[bool]
+    games: Mapped[int]
+    picks: Mapped[int]
+    wins: Mapped[int]
+    win_rate: Mapped[float]
+    pick_rate: Mapped[float]
     sample_size: Mapped[int]

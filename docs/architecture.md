@@ -11,11 +11,12 @@ One SQLite file (`data/knowledge.db`, gitignored — regenerate it by running
 migrations + ingestion), one normalized schema. `docs/sepc.md`'s "Database"
 section lists knowledge, statistical, and OTP tables together as a single
 schema rather than separate physical databases; the knowledge tables plus
-the match-capture and match/matchup-pairing statistical tables (`matches`,
+the match-capture, pairing, and final-build statistical tables (`matches`,
 `match_participants`, `matchup_statistics`, `champion_synergy`,
-`champion_counters`) exist today — the rest of Component 2 (rune/item/
-skill-order stats, build paths, game-duration splits) and all of Component 3
-(OTP) are still to come. Schema is managed by Alembic (`migrations/`), not
+`champion_counters`, `item_statistics`, `rune_statistics`) exist today — the
+rest of Component 2 (purchase order, skill order, true build paths,
+game-duration splits) and all of Component 3 (OTP) are still to come.
+Schema is managed by Alembic (`migrations/`), not
 `Base.metadata.create_all()` — every schema change is a migration.
 
 The CLAUDE.md hard rule that `/model` never imports the statistical-DB query
@@ -40,12 +41,15 @@ both exist, not by physical file separation (there's no `/model` yet).
 | `matchup_statistics` | `riot_api` | per `(patch, champion, role)` win/pick/ban rate, recomputed in full on every run |
 | `champion_synergy` | `riot_api` | symmetric ally-pair win rate per `(patch, champion+role, champion+role)`, recomputed in full on every run |
 | `champion_counters` | `riot_api` | directional enemy-pair win rate per `(patch, champion+role, enemy champion+role)`, recomputed in full on every run |
+| `item_statistics` | `riot_api` | per `(patch, champion+role, item)` win/pick rate from final item builds, recomputed in full on every run |
+| `rune_statistics` | `riot_api` | per `(patch, champion+role, rune)` win/pick rate from selected runes, recomputed in full on every run |
 
 `matches`/`match_participants`/`matchup_statistics`/`champion_synergy`/
-`champion_counters` have a working, tested pipeline (`ingestion/riot_api`)
-but **zero live rows** in this environment — no `RIOT_API_KEY` is configured
-here, and every test monkeypatches the client layer rather than hitting the
-real API (same pattern as `data_dragon`/`wiki`). Running
+`champion_counters`/`item_statistics`/`rune_statistics` have a working,
+tested pipeline (`ingestion/riot_api`) but **zero live rows** in this
+environment — no `RIOT_API_KEY` is configured here, and every test
+monkeypatches the client layer rather than hitting the real API (same
+pattern as `data_dragon`/`wiki`). Running
 `python -m ingestion.run --source riot_api --patch <patch>` against real
 data requires your own key (register at the Riot Developer Portal).
 
@@ -252,17 +256,19 @@ champions with no Fandom page as of this writing are now loaded.
 
 ### `riot_api`
 
-Component 2 (statistical DB, `docs/sepc.md`)'s match-capture and
-match/matchup-pairing slice. Captures raw high-ELO ranked-solo matches and
-derives three statistics end to end: per `(patch, champion, role)`
-win/pick/ban rate (`matchup_statistics`), symmetric ally-pair win rate
-(`champion_synergy`), and directional enemy-pair win rate
-(`champion_counters`). Deliberately scoped down from the full Component 2
-breadth — rune/item/skill-order stats and build paths are not built yet
-(see Known gaps below); this slice proves the pipeline shape (auth, rate
-limiting, patch filtering, idempotent capture, derived aggregation) on
-data already captured in `match_participants`, the same incremental
-approach `data_dragon` → `wiki` took for the knowledge DB.
+Component 2 (statistical DB, `docs/sepc.md`)'s match-capture,
+matchup-pairing, and final-build slice. Captures raw high-ELO ranked-solo
+matches and derives five statistics end to end: per `(patch, champion,
+role)` win/pick/ban rate (`matchup_statistics`), symmetric ally-pair win
+rate (`champion_synergy`), directional enemy-pair win rate
+(`champion_counters`), and per-`(patch, champion+role, item/rune)` final
+build win rate (`item_statistics`/`rune_statistics`). Deliberately scoped
+down from the full Component 2 breadth — purchase order, skill order, and
+true build paths are not built yet (see Known gaps below); this slice
+proves the pipeline shape (auth, rate limiting, patch filtering, idempotent
+capture, derived aggregation) on data already captured in
+`match_participants`/its `raw_data`, the same incremental approach
+`data_dragon` → `wiki` took for the knowledge DB.
 
 **Seeding:** Challenger league only (`League-V4`), capped at
 `RiotApiSettings.max_seed_summoners` (default 300) so a run's request volume
@@ -321,9 +327,26 @@ solo/duo, but would misclassify a non-two-team queue (e.g. Arena) if this
 source is ever pointed at one; not a concern while `queue_id` stays fixed
 to 420.
 
-**Deferred, on purpose (tracked in Known gaps):** rune/item/skill-order
-stats and build paths (needs the Match-V5 timeline endpoint, not just the
-match summary), multi-region crawling, and historical-patch backfill.
+**`item_statistics`/`rune_statistics`:** final-build only — which items
+ended up in the final item set (`item0`..`item5`) and which runes were
+selected (both primary and secondary paths, 6 selections total), read
+straight out of `match_participants.raw_data` (already fetched, no new API
+calls). `item6` (the trinket slot) is deliberately excluded — near-uniform
+per role, not informative for build comparison. Unlike
+`matchup_statistics`'s `games` (total patch games, a constant across rows),
+`games` here is the champion+role's own game count, so `pick_rate` reads as
+"build rate given this champion+role" rather than "share of all role slots
+patch-wide." **Known gap:** stat-shard perks (`statPerks.offense`/`flex`/
+`defense`, e.g. Adaptive Force, Attack Speed) are not captured — Data
+Dragon's rune tree (what populates the `runes` table) has no entries for
+them at all, so there's no `Rune` row to key a `rune_statistics` row
+against; a real fix needs its own small hardcoded shard-id table, not
+solved by this slice.
+
+**Deferred, on purpose (tracked in Known gaps):** purchase order, skill
+order, and true build paths (all need the Match-V5 *timeline* endpoint, not
+just the match summary this module fetches), multi-region crawling, and
+historical-patch backfill.
 
 ## Config (`config/settings.py`)
 
@@ -355,14 +378,16 @@ Per `docs/sepc.md`'s Phase 1 scope, still outstanding:
 - **Semantic tag / numeric rating pipeline** (`champion_ratings`, the
   `'llm'`/`'override'` side of `champion_tags`/`rune_tags`) — LLM extraction
   from ability/item/rune text plus a manual override file that always wins.
-- **Statistical DB** (Component 2) — match capture, win/pick/ban rate, and
-  ally/enemy pairing done (`riot_api`: `matches`, `match_participants`,
-  `matchup_statistics`, `champion_synergy`, `champion_counters`, see
-  above), but no live data has been ingested in this environment (needs a
-  `RIOT_API_KEY`). Still outstanding within Component 2: rune/item/
-  skill-order win rates, build paths, game-duration splits, multi-region
-  crawling, historical-patch backfill, and Lolalytics as an isolated,
-  ToS-checked fallback source.
+- **Statistical DB** (Component 2) — match capture, win/pick/ban rate,
+  ally/enemy pairing, and final-build item/rune win rates done (`riot_api`:
+  `matches`, `match_participants`, `matchup_statistics`, `champion_synergy`,
+  `champion_counters`, `item_statistics`, `rune_statistics`, see above), but
+  no live data has been ingested in this environment (needs a
+  `RIOT_API_KEY`). Still outstanding within Component 2: purchase order,
+  skill order, and true build paths (needs the Match-V5 timeline endpoint),
+  stat-shard perk stats, game-duration splits, multi-region crawling,
+  historical-patch backfill, and Lolalytics as an isolated, ToS-checked
+  fallback source.
 - **OTP DB** (Component 3) — OneTricks.gg.
 - **Build archetype extraction** — needs both of the above; `riot_api`'s
   current slice alone isn't enough (no build/item/rune data captured yet).
