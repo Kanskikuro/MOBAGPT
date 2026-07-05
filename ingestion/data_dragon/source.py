@@ -62,6 +62,8 @@ class DataDragonSource(IngestionSource):
 
         item_count = 0
         for item_id_str, item_data in data["items"].items():
+            if not is_summoners_rift_item(item_data):
+                continue
             _upsert_item(session, patch_row.id, item_id_str, item_data)
             item_count += 1
 
@@ -184,6 +186,17 @@ def _upsert_champion(session: Session, patch_id: int, champ_data: dict) -> None:
         )
 
 
+def is_summoners_rift_item(item_data: dict) -> bool:
+    """This project drafts and builds for Summoner's Rift only (docs/sepc.md's
+    target_role/pick_position fields assume 5v5 SR drafting). Data Dragon's
+    item.json includes every map/mode - ARAM, Arena, Nexus Blitz, etc. - and
+    non-purchasable auto-granted components, none of which are relevant here.
+    """
+    maps = item_data.get("maps", {})
+    purchasable = item_data.get("gold", {}).get("purchasable", False)
+    return bool(maps.get("11", False)) and purchasable
+
+
 def _upsert_item(session: Session, patch_id: int, item_id_str: str, item_data: dict) -> None:
     item_id = int(item_id_str)
     gold = item_data.get("gold", {})
@@ -197,6 +210,10 @@ def _upsert_item(session: Session, patch_id: int, item_id_str: str, item_data: d
             gold_base=gold.get("base", 0),
             gold_total=gold.get("total", 0),
             gold_sell=gold.get("sell", 0),
+            stats=item_data.get("stats", {}),
+            depth=item_data.get("depth"),
+            builds_from=item_data.get("from", []),
+            builds_into=item_data.get("into", []),
             patch_id=patch_id,
             raw_data=item_data,
         )

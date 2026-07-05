@@ -26,5 +26,18 @@ class PatchPolicy:
     max_patch_lookback: int = 3
 
 
+@dataclass(frozen=True)
+class WikiSettings:
+    base_url: str = "https://leagueoflegends.fandom.com"
+    api_path: str = "/api.php"
+    user_agent: str = (
+        "MOBAGPT-research/0.1 (hobby project data pipeline; "
+        "contact: kanski.kuro@gmail.com)"
+    )
+    request_timeout_seconds: float = 10.0
+    request_delay_seconds: float = 0.5
+
+
 DATA_DRAGON = DataDragonSettings()
 PATCH_POLICY = PatchPolicy()
+WIKI = WikiSettings()

@@ -10,9 +10,11 @@ import argparse
 from db.session import make_engine, session_scope
 from ingestion.base import IngestionSource
 from ingestion.data_dragon.source import DataDragonSource
+from ingestion.wiki.source import WikiSource
 
 SOURCES: dict[str, type[IngestionSource]] = {
     "data_dragon": DataDragonSource,
+    "wiki": WikiSource,
 }
 
 

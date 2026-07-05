@@ -1,0 +1,31 @@
+{{{{{1<noinclude>|Ability data</noinclude>}}}|Orb of Deception|{{{2|}}}|{{{3|}}}|{{{4|}}}|{{{5|}}}
+|champion     = Ahri
+|skill        = Q
+|icon         = Orb of Deception.png
+|description  = {{sbc|Active:}} '''Ahri''' sends her orb in the target direction that deals {{as|magic damage}} to enemies hit. At maximum range, the orb homes back to her to deal the same in {{as|{{sti|true damage}}|td}} to enemies hit.
+|leveling     = {{st|Damage Per Pass|{{ap|40 to 140}} {{as|(+ 50% AP)}}|Total Mixed Damage|{{ap|40*2 to 140*2}} {{as|(+ {{ap|50*2}}% AP)}}}}
+|description2 = ''Enemies can be hit only once per pass.''
+|range        = {{tip|cr|icononly = true}} {{tt|900|Without return point aoe}}
+|width        = {{tip|er|icononly = true}} 200
+|effect radius= {{tip|cr|icononly = true}} {{tt|100|Circle check at return point}}
+|speed        = {{tt|1550|Outgoing missile}} / {{tt|60 - 2600|Returning missile, acceleration 1900}}
+|cast time    = {{fd|0.25}}
+|cooldown     = 7
+|cost         = {{ap|55 to 95}}
+|costtype     = mana
+|targeting    = Direction
+|affects      = Enemies
+|damagetype   = {{tip|Magic damage|Magic}} / {{tip|True damage|True}}
+|spellshield  = Special
+|spelleffects = Area of effect
+|projectile   = True
+|notes        = 
+* ''Orb of Deception'' will hit additional units around the return point in a small circle when the orb turns around.
+** This applies both to the initial and return missile's damage, but the initial missile only deals damage if the unit was not hit by it already.
+* Each pass of the projectile can only damage an enemy once.
+* If '''Ahri''' dies while the orb is out, the orb will visually disappear but continue to deal damage and return to '''Ahri'''.{{bug}}
+{{Effect at cast time end}}
+|video        = Ahri QVideo.webm
+<!--Blurb-->
+|blurb        = {{sbc|Active:}} {{ci|Ahri}} sends out her orb that deals {{as|magic damage}} to enemies hit. At maximum range, the orb homes back to '''Ahri''' to deal {{as|true damage}} to enemies hit.
+}}

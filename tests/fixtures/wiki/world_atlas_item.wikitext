@@ -1,0 +1,67 @@
+{{Item info
+|goldvalue = 
+|goldefficiency = 
+|similaritems = 
+|background = 
+|notes = 
+* The earliest game time that the first {{sbc|Quest}} charge can be granted is 1:50.
+* {{sbc|Quest's}} execute against minions counts as a minion kill for the allied champion that was granted the kill gold.
+{{Diminishing gold info}}
+|strategy = 
+|oldicons = 
+|trivia = 
+|quotes = 
+|media = 
+<gallery captionalign="center" orientation="square" spacing="small">
+Quest charges VFX.png|Charges VFX
+Quest charge damage VFX.png|Damage Charge Consume VFX
+Quest charge execute VFX.png|Minion Execute VFX
+Quest charge gold VFX.png|Gold Granted VFX
+Support Quest complete VFX.png|Quest Complete VFX
+Support Quest complete star VFX.png|Star VFX
+</gallery>
+|sfx =
+;Minion Executed
+* {{sm2|Support item minion execute SFX 2.ogg}} Passive SFX
+* {{sm2|Support item minion execute SFX.ogg}} Passive SFX
+
+;Quest Complete
+* {{sm2|Support item quest complete SFX 2.ogg}} Passive SFX
+|revisions = 
+|patchhistory = 
+;[[V14.6]]
+* Quest upgrade threshold reduced to {{g|400}} from {{g|500}}.
+* Gold from minions reduced to {{g|15}} from {{g|20}}.
+* Gold from damage reduced to {{g|{{rd|22|20}}}} from {{g|{{rd|30|28}}}}.
+* Now limited to 1 {{sbc|Starter}} item instead of 1 {{sbc|Support / Jungle}} item.
+
+;[[V14.5]]
+* {{sbc|Bug Fix:}} Minion execute passive can now properly be triggered to grant gold and consume a quest stack if the nearby allied champion was on the very edge of the item's range.
+
+;[[V14.4]]
+* Quest recharge timer increased to 20 seconds from 18.
+* First charge timer reduced to 1:50 from 2:08.
+* {{sbc|Removed:}} No longer provides bonus stacks if purchased later in the game.
+* {{sbc|Bug Fix:}} Passive no longer appears to trigger despite not doing so if the allied champion was at the edge of the item's passive range.
+
+;[[V14.3]]
+* {{sbc|Bug Fix:}} Executed minions no longer counts toward the reduced gold penalty.
+
+;[[V14.2]]
+* {{sbc|New Effect:}} Minion gold penalty now accounts for all champions that have a Support item, instead of each individual user. Additionally, every champion with a Support item now contributes towards hitting the minion penalty.
+
+;[[V14.1]] - Added
+* {{sbc|Cost:}} {{g|400}}.
+* {{sbc|Stats:}} 30 health, 25% base health regeneration, 25% base mana regeneration, {{g|3}} per 10 seconds.
+* {{sbc|Unique Passive - Quest:}} Grants a charge every 18 seconds, up to 3 charges. When an allied champion is within {{tip|er|icononly=true}} 1050 units of you, consume a charge in two ways:
+** Kill a minion by any means, granting you {{g|20}} and the nearest allied champion kill {{g|gold}}. Damaging a minion below {{as|'''below''' {{rd|50%|30%}} of its '''maximum''' health}} {{tip|execute|executes}} it.
+** Damage an enemy champion or structure with a basic attack or ability, up to one per attack or cast, granting you {{g|{{rd|30|28}}}}.
+* Earn {{g|500}} through this quest to automatically upgrade to {{ii|Runic Compass}}, gaining the ''Warding'' active with 3 wards in stock.
+* {{sbc|Passive:}} ''Receive diminishing gold from excessive minion kills.''
+* Limited to 1 {{sbc|Support}} / {{sbc|Jungle}} item.
+* {{sbc|Caption:}} "Seek, and you shall find."
+}}
+
+[[Category:Season 2024 item release]]
+[[pt-br:Atlas Mundial]]
+[[ru:Атлас мира]]

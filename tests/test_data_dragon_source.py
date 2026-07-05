@@ -46,8 +46,21 @@ ITEM_DATA = {
     "name": "Boots",
     "description": "Slightly increases Movement Speed.",
     "plaintext": "Slightly increases Movement Speed",
-    "gold": {"base": 300, "total": 300, "sell": 210},
+    "gold": {"base": 300, "total": 300, "sell": 210, "purchasable": True},
     "tags": ["Boots"],
+    "maps": {"11": True, "12": True},
+    "stats": {"FlatMovementSpeedMod": 25},
+    "depth": 1,
+    "into": ["1001", "1002"],
+}
+
+ARAM_ONLY_ITEM_DATA = {
+    "name": "Suspicious ARAM-Only Trinket",
+    "description": "Not available on Summoner's Rift.",
+    "plaintext": "",
+    "gold": {"base": 0, "total": 0, "sell": 0, "purchasable": True},
+    "tags": [],
+    "maps": {"11": False, "12": True},
 }
 
 RUNE_TREE = {
@@ -116,10 +129,29 @@ def test_load_is_idempotent(session: Session) -> None:
 
     boots = session.execute(select(Item).where(Item.item_id == 1001)).scalar_one()
     assert {t.tag for t in boots.tags} == {"Boots"}
+    assert boots.stats == {"FlatMovementSpeedMod": 25}
+    assert boots.depth == 1
+    assert boots.builds_from == []
+    assert boots.builds_into == ["1001", "1002"]
 
     rune = session.execute(select(Rune).where(Rune.rune_id == 8112)).scalar_one()
     assert rune.path_name == "Domination"
     assert rune.name == "Electrocute"
+
+
+def test_load_skips_non_summoners_rift_items(session: Session) -> None:
+    source = DataDragonSource()
+    data = {
+        "champions": [],
+        "items": {"1001": ITEM_DATA, "9999": ARAM_ONLY_ITEM_DATA},
+        "rune_trees": [],
+    }
+
+    counts = source.load(session, "14.14.1", data)
+
+    assert counts["items"] == 1
+    names = {item.name for item in session.execute(select(Item)).scalars().all()}
+    assert names == {"Boots"}
 
 
 def test_load_champion_tags_not_duplicated_across_sources(session: Session) -> None:

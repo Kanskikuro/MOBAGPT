@@ -45,6 +45,12 @@ htmlcov/
 *.egg-info/
 data/*.db
 
+# Manually-curated raw source material (copied from wiki pages by hand for
+# champions with no automated-source page yet). Not generated, but not
+# something to redistribute via the repo either - copied third-party wiki
+# content, personal working files.
+data/manual_sources/
+
 # =========================
 # NODE / TYPESCRIPT
 # =========================

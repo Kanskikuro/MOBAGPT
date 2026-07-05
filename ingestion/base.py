@@ -48,6 +48,8 @@ class IngestionSource(ABC):
         dict of {entity_name: row_count} for the ingestion log."""
 
     def run(self, session: Session, patch: str | None = None) -> IngestionResult:
+        self.warnings: list[str] = []
+
         started_at = datetime.datetime.now(datetime.UTC)
         resolved_patch = self.resolve_patch(patch)
         data = self.fetch(resolved_patch)
@@ -60,4 +62,5 @@ class IngestionSource(ABC):
             started_at=started_at,
             finished_at=finished_at,
             counts=counts,
+            warnings=self.warnings,
         )

@@ -142,6 +142,34 @@ class ChampionAbility(Base):
     champion: Mapped["Champion"] = relationship(back_populates="abilities")
 
 
+class ChampionAbilityDetail(Base):
+    """Wiki-sourced supplement to ChampionAbility: exact scalings and hidden
+    mechanics Data Dragon's single description blurb omits (docs/sepc.md
+    Data Sources #3). Keyed by (champion_id, slot) rather than a FK to
+    ChampionAbility.id, since DataDragonSource deletes and re-inserts those
+    rows on every run (unstable ids). `slot` is free-form, not constrained
+    to passive/Q/W/E/R, because multi-form champions (e.g. Elise) have
+    extra named slots (e.g. "Venomous Bite") with no Data Dragon counterpart.
+    """
+
+    __tablename__ = "champion_ability_details"
+
+    champion_id: Mapped[int] = mapped_column(
+        ForeignKey("champions.champion_id"), primary_key=True
+    )
+    slot: Mapped[str] = mapped_column(primary_key=True)
+    notes: Mapped[str]
+    tips: Mapped[str] = mapped_column(default="")
+    fields: Mapped[dict] = mapped_column(JSON)
+    raw_wikitext: Mapped[str]
+    wiki_title: Mapped[str]
+    source: Mapped[str] = mapped_column(default="wiki")
+    patch_id: Mapped[int | None] = mapped_column(ForeignKey("patches.id"))
+    fetched_at: Mapped[datetime.datetime] = mapped_column(
+        default=lambda: datetime.datetime.now(datetime.UTC)
+    )
+
+
 class Item(Base):
     __tablename__ = "items"
 
@@ -152,6 +180,10 @@ class Item(Base):
     gold_base: Mapped[int]
     gold_total: Mapped[int]
     gold_sell: Mapped[int]
+    stats: Mapped[dict] = mapped_column(JSON, default=dict)
+    depth: Mapped[int | None]
+    builds_from: Mapped[list] = mapped_column(JSON, default=list)
+    builds_into: Mapped[list] = mapped_column(JSON, default=list)
     patch_id: Mapped[int | None] = mapped_column(ForeignKey("patches.id"))
     raw_data: Mapped[dict] = mapped_column(JSON)
 
@@ -190,6 +222,32 @@ class ItemEffect(Base):
     raw_data: Mapped[dict | None] = mapped_column(JSON)
 
     item: Mapped["Item"] = relationship(back_populates="effects")
+
+
+class ItemWikiDetail(Base):
+    """Wiki-sourced supplement to Item: Data Dragon's description is
+    sometimes empty or too shallow for items with complex mechanics (e.g.
+    quest/support items like World Atlas, whose real behavior - charge
+    timing, upgrade thresholds - only exists in prose). Unlike
+    ChampionAbilityDetail, items have no per-slot concept - one row per
+    item, keyed directly on item_id since Data Dragon's Item upsert doesn't
+    delete-and-reinsert (merge() on the natural id is stable across runs)."""
+
+    __tablename__ = "item_wiki_details"
+
+    item_id: Mapped[int] = mapped_column(
+        ForeignKey("items.item_id"), primary_key=True
+    )
+    notes: Mapped[str]
+    tips: Mapped[str] = mapped_column(default="")
+    fields: Mapped[dict] = mapped_column(JSON)
+    raw_wikitext: Mapped[str]
+    wiki_title: Mapped[str]
+    source: Mapped[str] = mapped_column(default="wiki")
+    patch_id: Mapped[int | None] = mapped_column(ForeignKey("patches.id"))
+    fetched_at: Mapped[datetime.datetime] = mapped_column(
+        default=lambda: datetime.datetime.now(datetime.UTC)
+    )
 
 
 class Rune(Base):
