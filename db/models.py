@@ -1,11 +1,13 @@
-"""Knowledge-database schema (Component 1 of docs/sepc.md).
+"""Knowledge-database schema (Component 1 of docs/sepc.md), plus the first
+slice of the statistical DB schema (Component 2): Match, MatchParticipant,
+MatchupStatistics, populated by ingestion/riot_api.
 
-Statistical DB tables (matchup_statistics, champion_synergy, champion_counters,
-otp_builds, otp_players, matches, evaluation_runs) live in the same physical
-SQLite file per docs/sepc.md's "Database" section, but are added in a later
-migration when Phase 1's statistical/OTP ingestion is built. The model/
-inference boundary is enforced by which query-layer module callers import
-(see CLAUDE.md), not by physical file separation.
+Remaining statistical DB tables (champion_synergy, champion_counters) and
+the OTP DB tables (otp_builds, otp_players, evaluation_runs) live in the
+same physical SQLite file per docs/sepc.md's "Database" section, but are
+added in a later migration when that ingestion exists. The model/inference
+boundary is enforced by which query-layer module callers import (see
+CLAUDE.md), not by physical file separation.
 """
 
 from __future__ import annotations
@@ -342,3 +344,71 @@ class ArchetypeTag(Base):
     delta: Mapped[float] = mapped_column(default=0.0)
 
     archetype: Mapped["BuildArchetype"] = relationship(back_populates="tags")
+
+
+class Match(Base):
+    """Raw Match-V5 match summary. `match_id` (Riot's string id, e.g.
+    "NA1_1234567890") is the natural key: match data is immutable once a
+    game is played, so re-ingesting an already-known match_id is a no-op
+    rather than requiring delete-then-reinsert like the mutable
+    data_dragon child collections."""
+
+    __tablename__ = "matches"
+
+    match_id: Mapped[str] = mapped_column(primary_key=True)
+    patch_id: Mapped[int | None] = mapped_column(ForeignKey("patches.id"))
+    queue_id: Mapped[int]
+    game_duration: Mapped[int]
+    game_creation: Mapped[datetime.datetime]
+    region: Mapped[str]
+    raw_data: Mapped[dict] = mapped_column(JSON)
+
+    participants: Mapped[list["MatchParticipant"]] = relationship(
+        back_populates="match", cascade="all, delete-orphan"
+    )
+
+
+class MatchParticipant(Base):
+    """One row per champion per match. Keyed on (match_id, champion_id) -
+    not puuid - since this project has no use for player identity, only
+    the champion/role/outcome tuple needed for matchup_statistics and (in a
+    later slice) champion_synergy/champion_counters."""
+
+    __tablename__ = "match_participants"
+    __table_args__ = (UniqueConstraint("match_id", "champion_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    match_id: Mapped[str] = mapped_column(ForeignKey("matches.match_id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    team_position: Mapped[str]  # Riot's TOP/JUNGLE/MIDDLE/BOTTOM/UTILITY
+    win: Mapped[bool]
+    kills: Mapped[int]
+    deaths: Mapped[int]
+    assists: Mapped[int]
+    raw_data: Mapped[dict] = mapped_column(JSON)
+
+    match: Mapped["Match"] = relationship(back_populates="participants")
+
+
+class MatchupStatistics(Base):
+    """Per (patch, champion, role) win/pick/ban rate, per docs/sepc.md
+    Component 2. Recomputed in full from match_participants/matches on every
+    ingestion/riot_api run for the resolved patch - a derived aggregate,
+    not a natural upsert, so it's deleted-and-reinserted per patch rather
+    than incrementally merged."""
+
+    __tablename__ = "matchup_statistics"
+    __table_args__ = (UniqueConstraint("patch_id", "champion_id", "role"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patch_id: Mapped[int] = mapped_column(ForeignKey("patches.id"))
+    champion_id: Mapped[int] = mapped_column(ForeignKey("champions.champion_id"))
+    role: Mapped[str]
+    games: Mapped[int]
+    wins: Mapped[int]
+    picks: Mapped[int]
+    bans: Mapped[int]
+    win_rate: Mapped[float]
+    pick_rate: Mapped[float]
+    ban_rate: Mapped[float]
+    sample_size: Mapped[int]

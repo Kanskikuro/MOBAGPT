@@ -1,7 +1,18 @@
+import datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from db.models import Champion, ChampionAbility, ChampionStats, ChampionTag, Patch
+from db.models import (
+    Champion,
+    ChampionAbility,
+    ChampionStats,
+    ChampionTag,
+    Match,
+    MatchParticipant,
+    MatchupStatistics,
+    Patch,
+)
 
 
 def test_champion_round_trip(session: Session) -> None:
@@ -75,3 +86,58 @@ def test_champion_round_trip(session: Session) -> None:
     assert [tag.tag for tag in fetched.tags] == ["Mage"]
     assert fetched.abilities[0].cooldown == [7, 6.5, 6, 5.5, 5]
     assert fetched.patch_id == patch.id
+
+
+def test_match_round_trip(session: Session) -> None:
+    patch = Patch(version="14.14.1")
+    session.add(patch)
+    session.flush()
+
+    session.add(
+        Match(
+            match_id="NA1_1",
+            patch_id=patch.id,
+            queue_id=420,
+            game_duration=1800,
+            game_creation=datetime.datetime(2026, 7, 1, tzinfo=datetime.UTC),
+            region="americas",
+            raw_data={"metadata": {"matchId": "NA1_1"}},
+        )
+    )
+    session.add(
+        MatchParticipant(
+            match_id="NA1_1",
+            champion_id=103,
+            team_position="MIDDLE",
+            win=True,
+            kills=5,
+            deaths=1,
+            assists=7,
+            raw_data={"championId": 103},
+        )
+    )
+    session.add(
+        MatchupStatistics(
+            patch_id=patch.id,
+            champion_id=103,
+            role="MIDDLE",
+            games=1,
+            wins=1,
+            picks=1,
+            bans=0,
+            win_rate=1.0,
+            pick_rate=0.5,
+            ban_rate=0.0,
+            sample_size=1,
+        )
+    )
+    session.commit()
+
+    match = session.execute(select(Match).where(Match.match_id == "NA1_1")).scalar_one()
+    assert len(match.participants) == 1
+    assert match.participants[0].champion_id == 103
+
+    stats = session.execute(
+        select(MatchupStatistics).where(MatchupStatistics.champion_id == 103)
+    ).scalar_one()
+    assert stats.win_rate == 1.0

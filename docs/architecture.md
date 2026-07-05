@@ -2,15 +2,19 @@
 
 What's actually implemented so far, as of patch `16.13.1`. For the full
 product vision and phased delivery plan, see [docs/sepc.md](sepc.md); this
-document only covers Phase 1's knowledge-DB work and how it's built.
+document covers Phase 1's knowledge-DB work plus the first slice of the
+statistical DB, and how they're built.
 
 ## Database
 
 One SQLite file (`data/knowledge.db`, gitignored — regenerate it by running
 migrations + ingestion), one normalized schema. `docs/sepc.md`'s "Database"
 section lists knowledge, statistical, and OTP tables together as a single
-schema rather than separate physical databases; only the knowledge tables
-exist today. Schema is managed by Alembic (`migrations/`), not
+schema rather than separate physical databases; the knowledge tables plus a
+first slice of the statistical tables (`matches`, `match_participants`,
+`matchup_statistics`) exist today — the rest of Component 2
+(`champion_synergy`, `champion_counters`) and all of Component 3 (OTP) are
+still to come. Schema is managed by Alembic (`migrations/`), not
 `Base.metadata.create_all()` — every schema change is a migration.
 
 The CLAUDE.md hard rule that `/model` never imports the statistical-DB query
@@ -30,6 +34,17 @@ both exist, not by physical file separation (there's no `/model` yet).
 | `items` | `data_dragon` | includes `stats` (flat stat mods), `depth`/`builds_from`/`builds_into` (build path) |
 | `item_tags` | `data_dragon` (`source='data_dragon'`) | |
 | `runes` | `data_dragon` | |
+| `matches` | `riot_api` | raw Match-V5 summary, keyed on Riot's `match_id` (immutable once played) |
+| `match_participants` | `riot_api` | one row per champion per match — `champion_id`/`team_position`/`win`, not player identity |
+| `matchup_statistics` | `riot_api` | per `(patch, champion, role)` win/pick/ban rate, recomputed in full on every run |
+
+`matches`/`match_participants`/`matchup_statistics` have a working,
+tested pipeline (`ingestion/riot_api`) but **zero live rows** in this
+environment — no `RIOT_API_KEY` is configured here, and every test
+monkeypatches the client layer rather than hitting the real API (same
+pattern as `data_dragon`/`wiki`). Running
+`python -m ingestion.run --source riot_api --patch <patch>` against real
+data requires your own key (register at the Riot Developer Portal).
 
 ### Tables that exist but are still empty
 
@@ -39,6 +54,10 @@ pipelines that don't exist yet (semantic tag/rating extraction, build
 archetype clustering from statistical + OTP data). Their schema is defined
 now so downstream code can be written against a stable shape, per the same
 pattern as everything else in this schema.
+
+`champion_synergy`/`champion_counters` (the rest of Component 2) and all of
+Component 3 (`otp_builds`, `otp_players`) don't exist as tables yet — no
+migration has added them.
 
 ## Ingestion
 
@@ -223,16 +242,81 @@ the Counters table (deferred for the automated `wiki` source, see above)
 comes along for free as plain resolved text — no `Template:Ctable` legend
 needed.
 
-**Currently loaded:** Ambessa (6 rows). Pending: Locke, Mel, Yunara, Zaahen
-— same process once transcribed.
+**Currently loaded:** Ambessa (6 rows), Locke (5 rows), Mel (5 rows), Yunara
+(7 rows — `Arc of Ruin` and `Untouchable Shadow`, the ultimate-upgraded forms
+of her W/E, get their own named slots rather than overloading `W`/`E`, same
+precedent as Ambessa's `Sundering Slam`), Zaahen (5 rows). All five
+champions with no Fandom page as of this writing are now loaded.
+
+### `riot_api`
+
+First slice of Component 2 (statistical DB, `docs/sepc.md`). Captures raw
+high-ELO ranked-solo matches and derives the simplest statistic (per
+`(patch, champion, role)` win/pick/ban rate) end to end. Deliberately scoped
+down from the full Component 2 breadth — synergy/counter matrices,
+rune/item/skill-order stats, and build paths are not built yet (see Known
+gaps below); this slice proves the pipeline shape (auth, rate limiting,
+patch filtering, idempotent capture, derived aggregation) on the smallest
+useful statistic first, the same incremental approach `data_dragon` → `wiki`
+took for the knowledge DB.
+
+**Seeding:** Challenger league only (`League-V4`), capped at
+`RiotApiSettings.max_seed_summoners` (default 300) so a run's request volume
+is predictable under a dev key's rate limit. A league entry's `puuid` is
+used directly when present; `Summoner-V4` is only called as a fallback for
+entries that lack it (`ingestion/riot_api/identity.py`), to avoid a second
+API call per summoner when unnecessary.
+
+**Rate limiting (`ingestion/riot_api/client.py`):** Riot enforces multiple
+sliding windows on the API key simultaneously (a dev key: 20 req/1s *and*
+100 req/2min) — a single fixed per-request delay, which is enough for the
+`wiki` source's one relevant window, can't safely satisfy several windows at
+once. `RateLimiter` tracks request timestamps per configured window and
+blocks just long enough to stay under all of them before every request; 429
+responses are retried honoring `Retry-After` when present.
+
+**Patch filtering:** Riot's match API has no "current patch" concept —
+`resolve_patch` requires an explicit `--patch` matching an already-ingested
+`data_dragon` version, same as `wiki`. Match IDs are pulled from each seed
+summoner's recent history regardless of patch, then each fetched match's
+`info.gameVersion` is checked against the target patch's `major.minor`
+prefix during `load()`; off-patch matches are counted and surfaced as a
+warning rather than silently dropped.
+
+**Idempotency:** match data is immutable once a game is played, so
+`match_id` (Riot's own string id) is the natural key — `load()` skips any
+match already present rather than needing data_dragon's
+delete-then-reinsert pattern for its unstable child rows.
+
+**`matchup_statistics`:** recomputed in full (deleted and reinserted) from
+every `match_participants` row for the resolved patch on each run, not just
+the newly-fetched batch — it's a derived aggregate, not a natural upsert.
+`pick_rate`/`ban_rate` are expressed as a fraction of `games * 2` (two
+team-slots per role per game). **Known limitation:** bans have no role
+attribution in Riot's raw data (a ban happens before role assignment), so
+ban counts are champion-level only; a champion that's frequently banned but
+never picked in a given patch currently has no `matchup_statistics` row to
+attach that ban count to at all — fixing this (e.g. a champion-level-only
+row shape, or a separate bans table) is a follow-up, not solved by this
+slice.
+
+**Deferred, on purpose (tracked in Known gaps):** `champion_synergy`/
+`champion_counters` (needs cross-participant pairing within a match),
+rune/item/skill-order stats and build paths (needs the Match-V5 timeline
+endpoint, not just the match summary), multi-region crawling, and
+historical-patch backfill.
 
 ## Config (`config/settings.py`)
 
 Frozen dataclasses, one per concern: `DataDragonSettings`, `WikiSettings`,
-`PatchPolicy` (the last one belongs to the not-yet-built statistical DB).
-This is where the CLAUDE.md rule "config values... never hard-coded" is
-enforced — DB path, external API base URLs, timeouts, and politeness
-delays all live here, not scattered through ingestion code.
+`RiotApiSettings`, `PatchPolicy` (the last one governs statistical-DB patch
+fallback for the training pipeline, not yet built). This is where the
+CLAUDE.md rule "config values... never hard-coded" is enforced — DB path,
+external API base URLs, timeouts, rate limits, and politeness delays all
+live here, not scattered through ingestion code. `RiotApiSettings.api_key`
+is the one field sourced from outside this file (the `RIOT_API_KEY`
+environment variable) rather than a literal default, since it's a secret,
+never committed.
 
 ## Testing
 
@@ -252,10 +336,16 @@ Per `docs/sepc.md`'s Phase 1 scope, still outstanding:
 - **Semantic tag / numeric rating pipeline** (`champion_ratings`, the
   `'llm'`/`'override'` side of `champion_tags`/`rune_tags`) — LLM extraction
   from ability/item/rune text plus a manual override file that always wins.
-- **Statistical DB** (Component 2) — Riot API primary source, Lolalytics as
-  an isolated, ToS-checked fallback.
+- **Statistical DB** (Component 2) — first slice done (`riot_api`: raw
+  matches + per-champion/role win/pick/ban rate, see above), but no live
+  data has been ingested in this environment (needs a `RIOT_API_KEY`).
+  Still outstanding within Component 2: `champion_synergy`/
+  `champion_counters` matrices, rune/item/skill-order win rates, build
+  paths, game-duration splits, multi-region crawling, historical-patch
+  backfill, and Lolalytics as an isolated, ToS-checked fallback source.
 - **OTP DB** (Component 3) — OneTricks.gg.
-- **Build archetype extraction** — needs both of the above.
+- **Build archetype extraction** — needs both of the above; `riot_api`'s
+  first slice alone isn't enough (no build/item/rune data captured yet).
 - **Wiki Counters-table parsing** — decode `Template:Ctable`'s legend.
 - **Runes, mechanics, minions, monsters wiki enrichment** — each needs its
   own page-structure discovery pass, the same way champions and items were
