@@ -33,12 +33,14 @@ both exist, not by physical file separation (there's no `/model` yet).
 | `patches` | `data_dragon` | one row per ingested Data Dragon version |
 | `champions` | `data_dragon` | numeric id, riot key, display name, normalized name, title |
 | `champion_stats` | `data_dragon` | base/per-level stats + Riot's own 1-10 attack/defense/magic/difficulty ratings |
-| `champion_tags` | `data_dragon` (`source='data_dragon'`) | Riot's coarse tags (Fighter, Mage, ...) |
+| `champion_tags` | `data_dragon` (`source='data_dragon'`), `knowledge` (`source='llm'`/`'override'`) | Riot's coarse tags plus the semantic taxonomy (burst, engage, tank, ...) from the knowledge/ pipeline, see below |
 | `champion_abilities` | `data_dragon` | passive + spells; **rows are unstable across re-runs** (delete-then-reinsert, see below) |
 | `champion_ability_details` | `wiki` (`source='wiki'`) and `manual` (`source='manual'`) | exact scalings, hidden mechanics, tips — see below |
 | `items` | `data_dragon` | includes `stats` (flat stat mods), `depth`/`builds_from`/`builds_into` (build path) |
-| `item_tags` | `data_dragon` (`source='data_dragon'`) | |
+| `item_tags` | `data_dragon` (`source='data_dragon'`), `knowledge` (`source='llm'`/`'override'`) | Riot's coarse tags plus the semantic taxonomy from the knowledge/ pipeline |
 | `runes` | `data_dragon` | |
+| `rune_tags` | `knowledge` (`source='llm'`/`'override'`) | semantic taxonomy only — Data Dragon has no native rune tags |
+| `champion_ratings` | `knowledge` (`source='llm'`/`'override'`) | numeric 0-10 ratings (engage, frontline, scaling_curve, ...), see below |
 | `matches` | `riot_api` | raw Match-V5 summary, keyed on Riot's `match_id` (immutable once played) |
 | `match_participants` | `riot_api` | one row per champion per match — `champion_id`/`team_position`/`win`, not player identity |
 | `matchup_statistics` | `riot_api` | per `(patch, champion, role)` win/pick/ban rate, recomputed in full on every run |
@@ -52,6 +54,9 @@ both exist, not by physical file separation (there's no `/model` yet).
 | `skill_order_statistics` | `riot_api` | per `(patch, champion+role, level, skill_slot, level_up_type)` win/pick rate from ability leveling order, recomputed in full on every run |
 | `otp_players` | `otp` | one row per identified one-trick main, keyed on `(puuid, primary_champion_id)`, not patch-scoped |
 | `otp_builds` | `otp` | one row per (otp_player, sampled match) — raw-instance build capture, not a pre-aggregated `*_statistics` table |
+| `build_archetypes` | `knowledge.archetypes` | per champion+role, a named archetype ("AD Burst", "Tank", ...); **no `patch_id` column** — full delete-then-reinsert per champion on every run, see below |
+| `archetype_items` / `archetype_runes` | `knowledge.archetypes` | an archetype's representative items/runes, `build_order`/`is_keystone` cross-referenced from `build_path_statistics`/`rune_statistics` |
+| `archetype_tags` | `knowledge.archetypes` | one row per `config.taxonomy.RATING_NAMES`, `delta` — the archetype's functional-profile shift Phase 2 applies on top of `champion_ratings` |
 
 `matches`/`match_participants`/`matchup_statistics`/`champion_synergy`/
 `champion_counters`/`item_statistics`/`rune_statistics`/
@@ -63,16 +68,17 @@ monkeypatches the client layer rather than hitting the real API (same
 pattern as `data_dragon`/`wiki`). Running
 `python -m ingestion.run --source riot_api --patch <patch>` (or `--source
 otp`) against real data requires your own key (register at the Riot
-Developer Portal).
+Developer Portal). `knowledge.archetypes` inherits the same gap
+transitively — it clusters `match_participants`/`otp_builds`, so it also
+produces zero rows here regardless of its own logic being fully tested
+against synthetic fixtures.
 
 ### Tables that exist but are still empty
 
-`champion_ratings`, `rune_tags`, `item_effects`, `build_archetypes` +
-`archetype_items`/`archetype_runes`/`archetype_tags` — all depend on
-pipelines that don't exist yet (semantic tag/rating extraction, build
-archetype clustering from statistical + OTP data). Their schema is defined
-now so downstream code can be written against a stable shape, per the same
-pattern as everything else in this schema.
+`item_effects` — structured passive/active effect breakdown, a separate
+HTML-parsing task with no pipeline yet (see "Known gaps" below). Its schema
+is defined now so downstream code can be written against a stable shape,
+per the same pattern as everything else in this schema.
 
 ## Ingestion
 
@@ -500,36 +506,256 @@ failure).
 only captures the raw signal it needs), multi-region crawling, and
 historical-patch backfill for OTP data specifically.
 
+## `knowledge/` (semantic tag / numeric rating pipeline)
+
+Populates the `'llm'`/`'override'` rows of `champion_tags`/`item_tags`/
+`rune_tags` and all of `champion_ratings` (`docs/sepc.md` Component 1). This
+is the last blocker on build archetype extraction: archetypes cluster
+builds by the functional profile (tags + rating deltas) they confer, which
+needs a champion baseline profile to modify in the first place.
+
+Deliberately **not** built on `ingestion/base.py`'s `IngestionSource`: that
+interface assumes one external raw payload per patch, whereas this pipeline
+calls the LLM once per already-ingested DB row (reads from our own DB, not
+an external source) and isn't patch-scoped — none of its four target tables
+carry a `patch_id` column. `docs/sepc.md`'s repo-structure section itself
+separates `/ingestion` (external data sources) from `/knowledge` (tag/rating
+pipeline, build archetype extraction, overrides) as distinct concerns.
+
+**Taxonomy (`config/taxonomy.py`):** `SEMANTIC_TAGS`, a fixed set (burst,
+engage, tank, peel, wave_clear, ...), and `RATING_NAMES`, ten 0-10 ratings
+lifted directly from `docs/sepc.md`'s Model v0 feature-vector list (engage,
+disengage, frontline, peel, wave_clear, burst, sustained_dps, mobility,
+cc_score, scaling_curve) rather than invented separately, since that's the
+actual downstream consumer. Both are config per CLAUDE.md's hard rule —
+extraction/validation code imports them rather than hard-coding tag/rating
+strings.
+
+**Extraction (`knowledge/client.py`, `knowledge/prompts.py`,
+`knowledge/sourcetext.py`):** `sourcetext.py` assembles prompt input purely
+from already-ingested DB rows (champion: name/title/Riot tags/base-stat
+ratings/ability descriptions + wiki notes; item: name/description/plaintext/
+stats/Riot tags; rune: path/name/short+long desc) — no network access.
+`client.py` calls the Claude API (`LlmTaggingSettings.model`, Haiku by
+default for cheap/fast bulk classification) with a tool-forced call whose
+JSON schema constrains output to `SEMANTIC_TAGS`/`RATING_NAMES`; validation
+still defends against a provider not respecting that schema (unknown tags
+dropped, missing ratings defaulted to the 0-10 midpoint, out-of-range
+ratings clamped), each producing a warning rather than raising — same
+defensive-parsing philosophy as `ingestion/wiki`'s handling of inconsistent
+wiki markup. `knowledge/client.py`'s low-level `_call_anthropic` is the one
+function that talks to the network; tests monkeypatch it directly, same
+pattern as `ingestion/wiki/client.py`'s `_get`.
+
+**Overrides (`knowledge/overrides.py`, `data/tag_overrides.yaml`):** the
+manually reviewed file that always wins, per spec. Checked into the repo
+(unlike `data/manual_sources/`, which is gitignored third-party content) —
+`data/*.db` and `data/manual_sources/` are the only `data/` gitignore
+entries. Full-replacement semantics per field: specifying `tags` or
+`ratings` for an entity completely replaces the LLM-derived value for that
+field; an omitted field falls back to the LLM output. Unlike LLM output,
+this file is hand-curated, so an invalid tag/rating name or out-of-range
+value raises immediately at load time rather than being defensively
+dropped.
+
+**Loader/override-precedence wrinkle (`knowledge/loader.py`,
+`knowledge/query.py`):** `champion_tags`/`item_tags`/`rune_tags` key
+uniqueness on `(entity_id, tag, source)`, so `'llm'` and `'override'` rows
+*coexist* — each upsert here deletes-then-reinserts only its own
+`(entity_id, source)` rows (the exact convention `ingestion/data_dragon`
+already uses for `source='data_dragon'`, but via SQLAlchemy's ORM-enabled
+`delete()` rather than `Table.__table__.delete()`, so the session's
+identity map stays in sync across the many delete/reinsert cycles one
+`knowledge.run` invocation does). `champion_ratings` keys uniqueness on
+`(champion_id, rating_name)` alone — no `source` in the constraint — so at
+most one row can exist per rating name at all; an override there
+genuinely *replaces* the `'llm'` row rather than coexisting with it. Since
+tags can coexist across sources but ratings can't, only tags need a
+read-time precedence resolver: `knowledge/query.py`'s
+`effective_champion_tags`/`effective_item_tags`/`effective_rune_tags`
+return `'override'` rows when present, else `'llm'` rows (ignoring
+`champion_tags`'/`item_tags`' unrelated `'data_dragon'` rows entirely);
+`effective_champion_ratings` just returns whatever row exists, since the
+loader already guarantees there's only one. These `effective_*` functions
+are `knowledge/archetypes`' entry point (see below) for a build's tag
+profile, so the override-wins rule lives in one place.
+
+**CLI:** `python -m knowledge.run [--only champions|items|runes] [--force]`.
+Skips entities that already have a `source='llm'` row unless `--force`,
+since each entity costs a real LLM call and re-running for coverage of
+newly-ingested entities shouldn't re-pay for unchanged ones. No live rows
+exist in this environment — needs an `ANTHROPIC_API_KEY`, same requirement
+pattern as `RIOT_API_KEY`, and fails immediately with a clear error rather
+than a silent no-op if it's missing.
+
+**Explicitly out of scope:** `item_effects` (structured passive/active
+effect breakdown — separate, more mechanical parsing task, not tied to the
+tag/rating pipeline in the spec's wording). Build archetype extraction
+itself is `knowledge/archetypes/`, immediately below.
+
+## `knowledge/archetypes/` (build archetype extraction)
+
+Populates `build_archetypes` + `archetype_items`/`archetype_runes`/
+`archetype_tags` (docs/sepc.md Component 1) — the last empty part of the
+knowledge DB, consuming `knowledge`'s tag/rating pipeline, the statistical
+DB, and the OTP DB together to finally produce the `(champion, build
+archetype)` unit the whole project is designed around.
+
+**Observed builds (`builds.py`):** two sources, per the spec's "cluster
+observed builds from statistical + OTP data":
+- **Challenger-aggregate** — `match_participants` for the resolved patch,
+  parsed via new `ingestion/riot_api/participants.py`'s `final_items`/
+  `rune_selections` (promoted out of `ingestion/otp/source.py`'s former
+  private `_final_items`/`_rune_selections`, the same "shared so both
+  callers use it verbatim" precedent as `ingestion.riot_api.timeline`/
+  `identity`). `item_statistics`/`rune_statistics` only store item-marginal/
+  rune-marginal aggregates, not each game's joint item+rune set, so this
+  reconstructs it fresh from the same `raw_data` those aggregates read.
+- **OTP** — `otp_builds`, already-parsed lists. Weighted by the sampled
+  player's sample size and win-rate consistency (docs/sepc.md's "Role of
+  OTP data"): `weight = min(1.0, games_sampled / otp_weight_normalizer) *
+  (0.5 + 0.5 * win_rate)`, vs. weight `1.0` for every aggregate build.
+
+**Which champion+role pairs to attempt:** driven by `matchup_statistics`
+rows for the resolved patch with `games >= ArchetypeSettings.
+min_builds_per_champion_role` — reuses the existing viability signal rather
+than inventing a new one, directly matching the spec's "every viable
+champion+role" phrasing.
+
+**`build_archetypes` has no `patch_id` column** — unlike the Component 2
+statistical tables, it was never patch-scoped in the schema. So this
+pipeline scopes its *input* gathering to one resolved patch (`--patch`,
+same CLI convention as `ingestion.run`/`knowledge.run`) but writes an
+evergreen "current best known archetypes" snapshot per champion, fully
+delete-then-reinserted on every run — the same "rows are unstable across
+re-runs" convention `ingestion/data_dragon` uses for `champion_abilities`.
+Because of this, all of a champion's roles are extracted and combined
+*before* the single per-champion upsert (`knowledge/archetypes/run.py`) —
+upserting once per role would each time wipe out the previous role's
+freshly-inserted archetypes for that champion.
+
+**Feature representation and clustering (`profile.py`, `clustering.py`):**
+each observed build becomes a tag-fraction vector over `config.taxonomy.
+SEMANTIC_TAGS` (fraction of its items+runes, via `knowledge.query.
+effective_item_tags`/`effective_rune_tags`, carrying each tag — 0 for
+everything if `knowledge.run` hasn't tagged those items/runes yet, so this
+degrades gracefully rather than crashing). Clustered per champion+role with
+`scipy.cluster.hierarchy` (`linkage(method="average")` + `fcluster(...,
+criterion="distance")`) — a distance threshold
+(`ArchetypeSettings.distance_threshold`, unverified against real data, same
+caveat as `OtpSettings`' mastery thresholds) rather than a fixed k, since
+guessing a per-champion cluster count upfront doesn't make sense.
+Clustering runs on **unweighted** vectors (structural similarity only); OTP
+vs. aggregate weighting is applied afterward when summarizing each
+resulting cluster — kept separate from the clustering geometry itself. A
+cluster becomes a real archetype only above `ArchetypeSettings.
+min_cluster_weight`; survivors are capped at `ArchetypeSettings.
+max_archetypes_per_champion_role` (highest weight first).
+
+**Per-archetype derivation (`extraction.py`) reuses already-computed
+statistics instead of re-deriving them:**
+- **Representative items/runes:** frequency-threshold over the cluster's
+  builds (`core_item_frequency`/`situational_item_frequency`/
+  `core_rune_frequency`). `ArchetypeItem.build_order`: each representative
+  item's highest-`pick_rate` `purchase_order` from `build_path_statistics`
+  for this champion+role/patch. `ArchetypeRune.is_keystone`: cross-
+  referenced from `rune_statistics.is_keystone` for this champion+role/patch.
+- **Damage-type label** (`naming.py`'s `damage_label`, "AD"/"AP"/`None`):
+  the only place damage type is computed anywhere in this project — sums a
+  small fixed set of AD vs. AP `Item.stats` keys
+  (`config.archetype_rules.AD_STAT_KEYS`/`AP_STAT_KEYS`) across the
+  cluster's representative items, since `SEMANTIC_TAGS` has no AD/AP tag of
+  its own.
+- **Name** (`BuildArchetype.name`): **user's explicit choice — a
+  deterministic rule table, not an LLM call per cluster** (free, instant,
+  traceable to the archetype's own computed profile).
+  `config.archetype_rules.ARCHETYPE_NAME_BY_TAG` maps the cluster's single
+  highest-fraction tag (among a curated subset, gated by
+  `ArchetypeSettings.name_tag_min_presence`) plus the damage label to a name
+  (e.g. `tank` → `"Tank"`, `burst` + `"AD"` → `"AD Burst"`), falling back to
+  `"{damage} Generalist"`. `BuildArchetype` has
+  `UniqueConstraint(champion_id, name)` — `naming.dedupe_name` resolves a
+  same-champion collision (e.g. two roles both scoring the same name) by
+  appending `" ({role})"`, then a numeric suffix.
+- **Rating deltas** (`deltas.py`, one `ArchetypeTag` row per
+  `config.taxonomy.RATING_NAMES`): `config.archetype_rules.RATING_TAG_MAP` —
+  a compact 10-entry table, not a dense matrix, since 7 of the 10
+  `RATING_NAMES` already share an exact name with a `SEMANTIC_TAGS` entry;
+  the rest map to their closest tag (`frontline`←`tank`, `cc_score`←
+  `cc_heavy`, `scaling_curve`←`scaling` minus `early_game`).
+  `delta = archetype_delta_scale * mapped_tag_fraction`, clamped to
+  ±`archetype_delta_max` — applied unconditionally (no presence-threshold
+  gate like naming has), since this is the archetype's *actual* functional
+  profile Phase 2's Model v0 reads ("numeric ratings after applying the
+  archetype's deltas"), not cosmetic labeling. Phase 2 adds this delta to
+  `champion_ratings` at feature-extraction time — this module doesn't read
+  the champion's baseline rating at all.
+
+**Loader (`loader.py`):** `BuildArchetype` has no column to scope a delete
+by (unlike `champion_tags`'s `source`), so a champion's archetypes are
+fully deleted and reinserted. Children (`ArchetypeItem`/`ArchetypeRune`/
+`ArchetypeTag`) have no `ondelete="CASCADE"` at the DB level and bulk
+`delete()` doesn't trigger ORM cascade, so they're deleted explicitly
+before their parent rows — otherwise re-running would silently accumulate
+orphaned child rows forever.
+
+**CLI:** `python -m knowledge.archetypes.run --patch <patch> [--champion
+<name>] [--role <role>]`. No live output exists in this environment — zero
+`matchup_statistics` rows without a `RIOT_API_KEY` means zero champion+role
+pairs clear the viability threshold, so a real run here completes cleanly
+reporting 0 archetypes rather than crashing (verified against the actual
+`data/knowledge.db`).
+
 ## Config (`config/settings.py`)
 
 Frozen dataclasses, one per concern: `DataDragonSettings`, `WikiSettings`,
-`RiotApiSettings`, `PatchPolicy` (the last one governs statistical-DB patch
-fallback for the training pipeline, not yet built). This is where the
-CLAUDE.md rule "config values... never hard-coded" is enforced — DB path,
-external API base URLs, timeouts, rate limits, and politeness delays all
-live here, not scattered through ingestion code. `RiotApiSettings.api_key`
-is the one field sourced from outside this file (the `RIOT_API_KEY`
-environment variable) rather than a literal default, since it's a secret,
-never committed.
+`RiotApiSettings`, `OtpSettings`, `LlmTaggingSettings`, `ArchetypeSettings`,
+`PatchPolicy` (the last one governs statistical-DB patch fallback for the
+training pipeline, not yet built). This is where the CLAUDE.md rule "config
+values... never hard-coded" is enforced — DB path, external API base URLs,
+timeouts, rate limits, politeness delays, and clustering/naming thresholds
+all live here, not scattered through ingestion/knowledge code.
+`RiotApiSettings.api_key` and `LlmTaggingSettings.api_key` are the fields
+sourced from outside this file (`RIOT_API_KEY`/`ANTHROPIC_API_KEY`
+environment variables) rather than a literal default, since they're
+secrets, never committed. Two vocabulary/rule modules live separately from
+`settings.py` since they're not runtime settings: `config/taxonomy.py`
+(`SEMANTIC_TAGS`, `RATING_NAMES` — the knowledge/ pipeline's fixed tag/
+rating vocabulary) and `config/archetype_rules.py` (`RATING_TAG_MAP`,
+`ARCHETYPE_NAME_BY_TAG`, `AD_STAT_KEYS`/`AP_STAT_KEYS` — `knowledge/
+archetypes/`'s derivation rules built on top of that vocabulary).
 
 ## Testing
 
 `tests/conftest.py::session` gives an in-memory SQLite DB via
 `Base.metadata.create_all()` (not migrations — faster, and schema-truth
 still comes from the models). No test hits real network: `ingestion/*`
-client functions are monkeypatched at the module level. The wiki parser
-tests run against real captured wikitext fixtures
-(`tests/fixtures/wiki/*.wikitext`) as well as synthetic cases, since real
-wikitext has quirks (stray HTML comments, inconsistent field presence) that
-hand-written fixtures don't reliably surface.
+client functions are monkeypatched at the module level, and
+`knowledge/client.py`'s `_call_anthropic` the same way (`tests/
+test_knowledge_*.py`). The wiki parser tests run against real captured
+wikitext fixtures (`tests/fixtures/wiki/*.wikitext`) as well as synthetic
+cases, since real wikitext has quirks (stray HTML comments, inconsistent
+field presence) that hand-written fixtures don't reliably surface.
+`tests/test_archetypes_*.py` need neither network nor LLM monkeypatching —
+build-archetype extraction is purely deterministic numerical logic
+(clustering, naming, deltas), so those tests exercise the real functions
+directly against seeded rows; where a test needs a small threshold (e.g.
+`min_builds_per_champion_role`) rather than dozens of rows, it monkeypatches
+`config.settings.ARCHETYPES` at each importing module's own name (each
+module binds its own reference at import time, so patching
+`config.settings.ARCHETYPES` itself wouldn't reach already-imported code).
 
 ## Known gaps / next steps
 
 Per `docs/sepc.md`'s Phase 1 scope, still outstanding:
 
-- **Semantic tag / numeric rating pipeline** (`champion_ratings`, the
-  `'llm'`/`'override'` side of `champion_tags`/`rune_tags`) — LLM extraction
-  from ability/item/rune text plus a manual override file that always wins.
+- ~~Semantic tag / numeric rating pipeline~~ — **done**: `knowledge/`
+  populates `champion_ratings` and the `'llm'`/`'override'` side of
+  `champion_tags`/`item_tags`/`rune_tags` (see the `knowledge/` section
+  above). No live rows exist in this environment (needs an
+  `ANTHROPIC_API_KEY`). `item_effects` (structured passive/active effect
+  breakdown) remains out of scope — separate parsing task, not tied to this
+  pipeline in the spec's wording.
 - **Statistical DB** (Component 2) — match capture, win/pick/ban rate,
   ally/enemy pairing, final-build item/rune win rates, itemization-counter
   stats, and completed-item/skill-order build stats done (`riot_api`:
@@ -556,10 +782,23 @@ Per `docs/sepc.md`'s Phase 1 scope, still outstanding:
   Lolalytics, so per the same precedent as `item_counter_statistics`, the
   one-trick signal (Champion-Mastery-V4 point concentration) and their
   builds (Match-V5, same as `riot_api`) are captured directly instead.
-- **Build archetype extraction** — needs both of the above; `champion_ratings`
-  (semantic tags/ratings) is still unstarted, so build archetype
-  clustering can't begin yet even though `otp_builds`/statistical data are
-  both now available to feed it.
+- ~~Build archetype extraction~~ — **done**: `knowledge/archetypes/`
+  clusters `match_participants` + `otp_builds` into `build_archetypes` +
+  `archetype_items`/`archetype_runes`/`archetype_tags` (see the
+  `knowledge/archetypes/` section above). This was the last empty part of
+  the knowledge DB. No live output exists in this environment (zero
+  `matchup_statistics` rows without a `RIOT_API_KEY` means zero
+  champion+role pairs clear the viability threshold); the clustering
+  distance threshold and frequency/weight thresholds
+  (`config.settings.ArchetypeSettings`) are unverified against real data,
+  same caveat as `OtpSettings`' mastery thresholds.
+- **`docs/data_report.md`** — Phase 1's "done when" criterion requires it
+  (coverage, gaps, sample sizes across all three DBs) and it doesn't exist
+  yet. With every Phase 1 pipeline now built (modulo the gaps below) and a
+  `RIOT_API_KEY` still needed to actually populate the statistical/OTP/
+  archetype data this environment lacks, this is the natural next step once
+  real data exists to report on — or the report can honestly state "0 rows,
+  pipeline untested against production data" if written before that.
 - **Wiki Counters-table parsing** — decode `Template:Ctable`'s legend.
 - **Runes, mechanics, minions, monsters wiki enrichment** — each needs its
   own page-structure discovery pass, the same way champions and items were

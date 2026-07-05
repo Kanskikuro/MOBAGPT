@@ -7,6 +7,9 @@ dependencies = [
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "requests>=2.31",
+    "anthropic>=0.40",
+    "pyyaml>=6.0",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]

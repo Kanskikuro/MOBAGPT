@@ -29,6 +29,7 @@ from db.models import OtpBuild, OtpPlayer, Patch
 from ingestion.base import IngestionSource
 from ingestion.riot_api import client, timeline
 from ingestion.riot_api.identity import seed_challenger_puuids
+from ingestion.riot_api.participants import final_items, rune_selections
 
 
 class OtpSource(IngestionSource):
@@ -187,9 +188,9 @@ class OtpSource(IngestionSource):
                         role=participant.get("teamPosition", ""),
                         starting_items=_starting_item_purchases(events, participant_id),
                         completed_items=completed_items,
-                        final_items=_final_items(participant),
-                        primary_runes=_rune_selections(participant, style_index=0),
-                        secondary_runes=_rune_selections(participant, style_index=1),
+                        final_items=final_items(participant),
+                        primary_runes=rune_selections(participant, style_index=0),
+                        secondary_runes=rune_selections(participant, style_index=1),
                         skill_order=[list(entry) for entry in skill_order],
                         enemy_champion_id=_lane_opponent(participants, participant),
                         raw_data=participant,
@@ -267,26 +268,6 @@ def _lane_opponent(participants: list[dict], participant: dict) -> int | None:
     return None
 
 
-def _final_items(participant: dict) -> list[int]:
-    """item0..item5; item6 (trinket) excluded - same convention as
-    ingestion.riot_api.source's _recompute_item_statistics."""
-
-    return [
-        item_id
-        for slot in range(6)
-        if (item_id := participant.get(f"item{slot}", 0)) > 0
-    ]
-
-
-def _rune_selections(participant: dict, style_index: int) -> list[int]:
-    styles = participant.get("perks", {}).get("styles", [])
-    if style_index >= len(styles):
-        return []
-    return [
-        selection["perk"]
-        for selection in styles[style_index].get("selections", [])
-        if selection.get("perk")
-    ]
 
 
 def _starting_item_purchases(events: list[dict], participant_id: int) -> list[int]:

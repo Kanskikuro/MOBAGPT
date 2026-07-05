@@ -113,8 +113,76 @@ class OtpSettings:
     starting_items_cutoff_ms: int = 90_000
 
 
+@dataclass(frozen=True)
+class LlmTaggingSettings:
+    """knowledge/ semantic tag + numeric rating pipeline (docs/sepc.md
+    Component 1). `api_key` follows the exact RiotApiSettings pattern: read
+    from an environment variable at import time, never hard-coded/committed.
+    Tests never need a real key since knowledge/client.py's low-level
+    Anthropic call is monkeypatched, same as ingestion/riot_api and
+    ingestion/wiki's HTTP clients."""
+
+    api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
+    model: str = "claude-haiku-4-5-20251001"  # cheap/fast, bulk classification
+    request_timeout_seconds: float = 30.0
+    max_retries: int = 3
+    override_file: Path = field(default_factory=lambda: REPO_ROOT / "data" / "tag_overrides.yaml")
+
+
+@dataclass(frozen=True)
+class ArchetypeSettings:
+    """knowledge/archetypes/ build-archetype extraction (docs/sepc.md
+    Component 1). Thresholds below are first-pass defaults, unverified
+    against real data - no RIOT_API_KEY is configured in this environment,
+    same caveat as OtpSettings' mastery thresholds."""
+
+    # A champion+role needs at least this many *weighted* observed builds
+    # (see otp_weight_normalizer below) before clustering is attempted at
+    # all - reuses matchup_statistics.games as the viability signal.
+    min_builds_per_champion_role: int = 20
+
+    # A cluster needs at least this much total weight to become a real
+    # archetype rather than being discarded as noise.
+    min_cluster_weight: float = 4.0
+
+    # Caps kept archetypes per champion+role to the highest-weight clusters,
+    # same "cap a run to something predictable" spirit as
+    # RiotApiSettings.max_seed_summoners.
+    max_archetypes_per_champion_role: int = 4
+
+    # scipy.cluster.hierarchy.fcluster's distance threshold in tag-fraction
+    # space (criterion="distance"). A stopping rule, not a target cluster
+    # count - avoids guessing k per champion.
+    distance_threshold: float = 0.6
+
+    # Fraction of a cluster's builds an item/rune must appear in to be
+    # counted as core (non-situational) vs. merely situational vs. dropped.
+    core_item_frequency: float = 0.6
+    situational_item_frequency: float = 0.2
+    core_rune_frequency: float = 0.5
+
+    # OTP build weight = min(1.0, games_sampled / otp_weight_normalizer) *
+    # (0.5 + 0.5 * win_rate) - "weighted by the player's sample size and
+    # consistency" per docs/sepc.md's Role of OTP data. Aggregate
+    # (Challenger match_participants) builds always weigh 1.0.
+    otp_weight_normalizer: int = 10
+
+    # ArchetypeTag.delta = archetype_delta_scale * mapped tag fraction
+    # (config.archetype_rules.RATING_TAG_MAP), clamped to +/- this bound -
+    # a rating delta shifting a 0-10 baseline shouldn't alone exceed it.
+    archetype_delta_scale: float = 4.0
+    archetype_delta_max: float = 5.0
+
+    # An archetype's name is driven by its single highest-fraction tag
+    # (config.archetype_rules.ARCHETYPE_NAME_BY_TAG) - only a tag clearing
+    # this presence fraction is eligible, else the generic fallback name.
+    name_tag_min_presence: float = 0.3
+
+
 DATA_DRAGON = DataDragonSettings()
 PATCH_POLICY = PatchPolicy()
 WIKI = WikiSettings()
 RIOT_API = RiotApiSettings()
 OTP = OtpSettings()
+LLM_TAGGING = LlmTaggingSettings()
+ARCHETYPES = ArchetypeSettings()

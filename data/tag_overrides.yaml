@@ -1,0 +1,30 @@
+# Manually reviewed overrides for the knowledge/ semantic tag + numeric
+# rating pipeline (docs/sepc.md Component 1). These always win over the
+# LLM's output (knowledge/run.py applies this file after LLM extraction).
+#
+# Full-replacement semantics per field: specifying `tags` or `ratings` for
+# an entity completely replaces the LLM-derived value for that field only;
+# an omitted field falls back to the LLM output untouched.
+#
+# Tags must come from config.taxonomy.SEMANTIC_TAGS; rating names from
+# config.taxonomy.RATING_NAMES (0-10). Both are validated on load -
+# knowledge/overrides.py raises immediately on an unrecognized name rather
+# than silently dropping it, since this file is hand-curated.
+#
+# Example:
+# champions:
+#   Ambessa:
+#     tags: [engage, dive, burst]
+#     ratings:
+#       engage: 8
+#       frontline: 6
+# items:
+#   Rageblade:
+#     tags: [sustained_dps]
+# runes:
+#   Electrocute:
+#     tags: [burst, execute]
+
+champions: {}
+items: {}
+runes: {}
